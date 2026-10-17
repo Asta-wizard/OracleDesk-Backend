@@ -18,9 +18,11 @@ import { config } from '../config';
 import { CONTRACTS } from '../config/contracts';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
+import { newId, runWithContext } from '../lib/context';
 import { readClients, rpcServer } from './stellar/clients';
 import { printable } from './chain.service';
 import { priceYesBps } from '../generated/fpmm';
+import { withTimeout, deadline } from '../lib/resilience';
 
 export type EventSource = Pick<rpc.Server, 'getEvents' | 'getHealth'>;
 
@@ -110,6 +112,15 @@ async function applySideEffects(event: DecodedEvent, emit: IndexerDeps['emit']):
     if (market) {
       await prisma.market.update({ where: { id: market.id }, data: { currentYesProb: yesBps / 10_000 } });
     }
+    if (Boolean(p.is_buy)) {
+      try {
+        const { reconcileFromTradeEvent } = await import('./copy-trade.service');
+        await reconcileFromTradeEvent(event);
+      } catch (err) {
+        logger.error({ err, eventId: event.id }, 'Indexer: copy trade reconciliation failed');
+      }
+    }
+
     emit('TRADE_EXECUTED', {
       onChainMarketId: onChainMarketId.toString(),
       marketId: market?.id ?? null,
@@ -151,13 +162,33 @@ async function applySideEffects(event: DecodedEvent, emit: IndexerDeps['emit']):
   }
 
   if (event.contractName === 'reasoningRegistry' && event.eventName === 'TracePublished') {
-    const traceHash = Buffer.from(p.trace_hash).toString('hex');
+    const traceHash =
+      typeof p.trace_hash === 'string'
+        ? p.trace_hash
+        : Buffer.from(p.trace_hash).toString('hex');
     const onChainTraceId = BigInt(p.trace_id);
-    const trace = await prisma.reasoningTrace.findFirst({ where: { traceHash }, select: { id: true, onChainTraceId: true } });
-    if (trace && trace.onChainTraceId === null) {
-      await prisma.reasoningTrace.update({
-        where: { id: trace.id },
-        data: { onChainTraceId, publishTxHash: event.txHash },
+    const onChainMarketId = BigInt(p.market_id);
+    const trace = await prisma.reasoningTrace.findFirst({
+      where: {
+        traceHash,
+        market: { onChainMarketId },
+      },
+      select: { id: true, onChainTraceId: true },
+    });
+    if (trace && (trace.onChainTraceId === null || trace.onChainTraceId === onChainTraceId)) {
+      // The event's trace_hash equals our stored traceHash, which is exactly
+      // what verification means for our own traces (#131).
+      if (trace.onChainTraceId === null) {
+        await prisma.reasoningTrace.update({
+          where: { id: trace.id },
+          data: { onChainTraceId, publishTxHash: event.txHash, verified: true },
+        });
+      } else {
+        await prisma.reasoningTrace.update({ where: { id: trace.id }, data: { verified: true } });
+      }
+      await prisma.tracePublication.updateMany({
+        where: { traceId: trace.id, status: { in: ['AWAITING_MARKET', 'READY', 'SUBMITTED'] } },
+        data: { status: 'CONFIRMED', confirmedAt: new Date(), lastError: null },
       });
     }
     emit('REASONING_PUBLISHED', {
@@ -194,49 +225,112 @@ async function writeCursor(lastLedger: number): Promise<void> {
 export async function backfillEvents(
   fromLedger?: number,
   deps: IndexerDeps = { source: rpcServer, emit: () => undefined },
+  opts?: { signal?: AbortSignal },
 ): Promise<{ startLedger: number; lastLedger: number; seen: number; stored: number }> {
-  const health = await deps.source.getHealth();
-  const cursor = await readCursor();
-  let startLedger = fromLedger ?? (cursor !== null ? cursor + 1 : health.oldestLedger);
+  const tickLimitMs = Math.floor(config.CYCLE_DEADLINE_MS / 10);
+  const handle = deadline('rpc-events', opts?.signal, tickLimitMs);
 
-  if (startLedger < health.oldestLedger) {
-    logger.warn(
-      { requested: startLedger, oldestAvailable: health.oldestLedger },
-      'Indexer cursor is older than RPC retention; resuming from the oldest available ledger. Events in between are not indexed.',
-    );
-    startLedger = health.oldestLedger;
-  }
-  if (startLedger > health.latestLedger) {
-    return { startLedger, lastLedger: cursor ?? health.latestLedger, seen: 0, stored: 0 };
-  }
+  try {
+    const health = await withTimeout('rpc-events', async () => deps.source.getHealth(), { signal: handle.signal });
+    const cursor = await readCursor();
+    let startLedger = fromLedger ?? (cursor !== null ? cursor + 1 : health.oldestLedger);
 
-  const known = specs();
-  const filters: rpc.Api.EventFilter[] = [{ type: 'contract', contractIds: [...known.keys()] }];
-  let seen = 0;
-  let stored = 0;
-  let latestLedger = health.latestLedger;
-  let page = await deps.source.getEvents({ startLedger, filters, limit: PAGE_LIMIT });
-
-  for (;;) {
-    latestLedger = page.latestLedger;
-    for (const raw of page.events) {
-      seen++;
-      const decoded = decodeEvent(raw, known);
-      if (!decoded) continue;
-      if (await store(decoded)) {
-        stored++;
-        await applySideEffects(decoded, deps.emit).catch((err) =>
-          logger.error({ err, eventId: decoded.id }, 'Indexer side effect failed'),
-        );
-      }
+    if (startLedger < health.oldestLedger) {
+      logger.warn(
+        { requested: startLedger, oldestAvailable: health.oldestLedger },
+        'Indexer cursor is older than RPC retention; resuming from the oldest available ledger. Events in between are not indexed.',
+      );
+      startLedger = health.oldestLedger;
     }
-    if (page.events.length < PAGE_LIMIT) break;
-    page = await deps.source.getEvents({ filters, cursor: page.cursor, limit: PAGE_LIMIT });
-  }
+    if (startLedger > health.latestLedger) {
+      return { startLedger, lastLedger: cursor ?? health.latestLedger, seen: 0, stored: 0 };
+    }
 
-  await writeCursor(latestLedger);
-  if (stored > 0) logger.info({ startLedger, lastLedger: latestLedger, seen, stored }, 'Indexed Stellar events');
-  return { startLedger, lastLedger: latestLedger, seen, stored };
+    const known = specs();
+    const filters: rpc.Api.EventFilter[] = [{ type: 'contract', contractIds: [...known.keys()] }];
+    let seen = 0;
+    let stored = 0;
+    let latestLedger = health.latestLedger;
+    let page = await withTimeout(
+      'rpc-events',
+      async () => deps.source.getEvents({ startLedger, filters, limit: PAGE_LIMIT }),
+      { signal: handle.signal },
+    );
+
+    for (;;) {
+      latestLedger = page.latestLedger;
+      for (const raw of page.events) {
+        seen++;
+        const decoded = decodeEvent(raw, known);
+        if (!decoded) continue;
+        if (await store(decoded)) {
+          stored++;
+          await applySideEffects(decoded, deps.emit).catch((err) =>
+            logger.error({ err, eventId: decoded.id }, 'Indexer side effect failed'),
+          );
+        }
+      }
+      if (page.events.length < PAGE_LIMIT) break;
+      page = await withTimeout(
+        'rpc-events',
+        async () => deps.source.getEvents({ filters, cursor: page.cursor, limit: PAGE_LIMIT }),
+        { signal: handle.signal },
+      );
+    }
+
+    await writeCursor(latestLedger);
+    if (stored > 0) logger.info({ startLedger, lastLedger: latestLedger, seen, stored }, 'Indexed Stellar events');
+    return { startLedger, lastLedger: latestLedger, seen, stored };
+  } finally {
+    handle.cleanup?.();
+  }
+}
+
+/**
+ * Re-applies one stored event's projections (#146). Unlike the normal path it
+ * does not insert the event first, so a restore can rebuild projections for
+ * rows that survived the backup. Callers replay in (ledger, id) order.
+ */
+export async function reprojectEvent(
+  event: DecodedEvent,
+  emit: IndexerDeps['emit'] = () => undefined,
+): Promise<void> {
+  await applySideEffects(event, emit);
+}
+
+/** Converts a stored row back into the decoded shape used by applySideEffects. */
+export function decodedFromStored(row: {
+  id: string;
+  contractId: string;
+  contractName: string;
+  eventName: string;
+  ledger: number;
+  ledgerClosedAt: Date;
+  txHash: string;
+  params: unknown;
+}): DecodedEvent {
+  return {
+    id: row.id,
+    contractId: row.contractId,
+    contractName: row.contractName as ContractName,
+    eventName: row.eventName,
+    ledger: row.ledger,
+    ledgerClosedAt: row.ledgerClosedAt.toISOString(),
+    txHash: row.txHash,
+    params: row.params as Record<string, any>,
+  };
+}
+
+// Poll state for health reporting (#111); module-level because one indexer runs per process.
+const pollState: { lastLedger: number | null; updatedAt: string | null; lastPollAt: string | null; lastPollError: string | null } = {
+  lastLedger: null,
+  updatedAt: null,
+  lastPollAt: null,
+  lastPollError: null,
+};
+
+export function indexerStatus() {
+  return { enabled: config.INDEXER_ENABLED, ...pollState };
 }
 
 /** Polls every INDEXER_POLL_MS. Returns a stop function. */
@@ -249,10 +343,15 @@ export function startEventListener(emit: IndexerDeps['emit']): () => void {
   let timer: NodeJS.Timeout | null = null;
   const tick = async () => {
     try {
-      await backfillEvents(undefined, { source: rpcServer, emit });
+      const result = await backfillEvents(undefined, { source: rpcServer, emit });
+      pollState.lastLedger = result.lastLedger;
+      pollState.updatedAt = new Date().toISOString();
+      pollState.lastPollError = null;
     } catch (err) {
+      pollState.lastPollError = err instanceof Error ? err.message : String(err);
       logger.warn({ err: err instanceof Error ? err.message : err }, 'Indexer poll failed; will retry');
     }
+    pollState.lastPollAt = new Date().toISOString();
     if (!stopped) timer = setTimeout(tick, config.INDEXER_POLL_MS);
   };
   void tick();

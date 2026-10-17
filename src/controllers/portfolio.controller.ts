@@ -16,7 +16,7 @@ export async function getPortfolio(req: Request, res: Response): Promise<void> {
   const [summary, correlations, availableCapitalRaw] = await Promise.all([
     getPortfolioSummary(),
     getPortfolioCorrelations(10_000),
-    treasuryAvailableCapital()
+    treasuryAvailableCapital(req.signal)
       .then((v) => v.toString())
       .catch((err) => {
         logger.warn({ err: err instanceof Error ? err.message : err }, 'treasury.available_capital read failed');
@@ -68,17 +68,22 @@ export async function getPositions(req: Request, res: Response): Promise<void> {
  * endpoint, commit 207464d, padded them with constants; this one doesn't.)
  */
 export async function getPlatformStats(_req: Request, res: Response): Promise<void> {
-  const [subscriberCount, copyVolume, marketCount, onChainMarketCount, traceCount] = await Promise.all([
+  const [subscriberCount, copyVolume, rawSumResult, marketCount, onChainMarketCount, traceCount] = await Promise.all([
     prisma.user.count(),
     prisma.copyTrade.aggregate({ _sum: { amount: true }, where: { status: 'EXECUTED' } }),
+    prisma.$queryRawUnsafe<Array<{ sum: string | null }>>(
+      `SELECT COALESCE(SUM("collateralRaw"::numeric), 0)::text as sum FROM copy_trades WHERE status = 'EXECUTED' AND "collateralRaw" IS NOT NULL`
+    ).catch(() => [{ sum: '0' }]),
     prisma.market.count(),
     prisma.market.count({ where: { onChainMarketId: { not: null } } }),
     prisma.reasoningTrace.count(),
   ]);
   const totalCopyVolume = copyVolume._sum.amount ?? 0;
+  const totalCopyVolumeRaw = rawSumResult[0]?.sum ?? '0';
   sendSuccess(res, {
     subscriberCount,
     totalCopyVolume,
+    totalCopyVolumeRaw,
     builderFees: 0,
     marketCount,
     onChainMarketCount,

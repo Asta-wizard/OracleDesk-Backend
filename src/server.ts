@@ -2,17 +2,30 @@ import http from 'http';
 import { Server } from 'socket.io';
 import app from './app';
 import { config } from './config';
+import { initSecrets, startSecretRefresh } from './config/secrets';
 import { logger } from './lib/logger';
 import { prisma } from './lib/prisma';
 import { startIngestionCron } from './cron/ingestion.cron';
 import { startMonitorCron } from './cron/monitor.cron';
-import { startReportCron } from './cron/report.cron';
+import { startTraceAuditCron } from './cron/trace-audit.cron';
+import { startTracePublicationCron } from './cron/trace-publication.cron';
 import { startEventListener } from './services/indexer.service';
 import { closeRedis } from './lib/redis';
+import { health } from './services/health.service';
 
 let stopEventListener: (() => void) | null = null;
+let stopSecretRefresh: (() => void) | null = null;
 
 async function bootstrap(): Promise<void> {
+  // 0. Resolve secrets (mounted files or the configured remote provider).
+  try {
+    await initSecrets(config);
+    stopSecretRefresh = startSecretRefresh(config);
+  } catch (err) {
+    logger.fatal({ err: err instanceof Error ? err.message : err }, 'Failed to initialise secrets');
+    process.exit(1);
+  }
+
   // 1. Connect to database
   try {
     await prisma.$connect();
@@ -45,7 +58,8 @@ async function bootstrap(): Promise<void> {
   // 4. Start cron jobs
   startIngestionCron();
   startMonitorCron();
-  startReportCron();
+  startTraceAuditCron();
+  startTracePublicationCron();
 
   io.on('connection', (socket) => {
     logger.info({ socketId: socket.id }, 'New client connected to socket.io');
@@ -68,21 +82,26 @@ async function bootstrap(): Promise<void> {
   // ─── Graceful Shutdown ───
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutting down gracefully...');
+    // Force exit if shutdown (drain + close) takes too long
+    setTimeout(() => {
+      logger.error('Forced shutdown after timeout');
+      process.exit(1);
+    }, 15_000);
+    // Report 503 from /readyz first so load balancers stop routing before the socket closes.
+    health.startDraining();
+    await new Promise((resolve) => setTimeout(resolve, config.SHUTDOWN_DRAIN_MS));
+    const { triggerShutdown } = await import('./lib/shutdown');
+    triggerShutdown();
 
     server.close(async () => {
       if (stopEventListener) stopEventListener();
+      if (stopSecretRefresh) stopSecretRefresh();
 
       await prisma.$disconnect();
       await closeRedis();
       logger.info('Database disconnected');
       process.exit(0);
     });
-
-    // Force exit if shutdown takes too long
-    setTimeout(() => {
-      logger.error('Forced shutdown after timeout');
-      process.exit(1);
-    }, 15_000);
   };
 
   process.on('SIGTERM', () => shutdown('SIGTERM'));
@@ -94,6 +113,7 @@ async function bootstrap(): Promise<void> {
   });
 
   process.on('uncaughtException', (err) => {
+    health.markFatal();
     logger.fatal({ err }, 'Uncaught exception — shutting down');
     process.exit(1);
   });

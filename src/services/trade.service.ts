@@ -1,9 +1,11 @@
 import { prisma } from '../lib/prisma';
+import { writeAgentLog } from '../lib/agent-log';
 import { logger } from '../lib/logger';
 import { AppError } from '../middlewares/error.middleware';
 import type { KellyResult, TradePayload, KellyInput } from '../types';
 import { agentBuy, Outcomes, quoteBuy } from './chain.service';
-import { pinAndPublishTrace } from './trace-publish.service';
+import { enqueueTracePublication } from './trace-publish.service';
+import { tradeTraceAction } from '../lib/trace-actions';
 import { usdcFromNumber } from '../lib/amounts';
 
 // ─── Risk constants ───
@@ -175,14 +177,18 @@ export async function executeTrade(payload: TradePayload): Promise<{
     }),
   ]);
 
-  // ── Step 5: Publish the trace hash to reasoning-registry (non-blocking) ──
-  if (payload.traceId && payload.tracePayload && market.onChainMarketId !== null) {
-    pinAndPublishTrace({
-      traceId: payload.traceId,
-      payload: payload.tracePayload,
-      action: payload.direction === 'YES' ? 'buy_yes' : 'buy_no',
-      onChainMarketId: market.onChainMarketId,
-    }).catch(err => logger.warn({ err }, 'Failed to pin/publish trade trace'));
+  // ── Step 5: Queue the trace for publication to reasoning-registry (#131) ──
+  // Durable: the worker pins, waits for the on-chain market and retries.
+  if (payload.traceId && payload.tracePayload) {
+    try {
+      await enqueueTracePublication({
+        traceId: payload.traceId,
+        payload: payload.tracePayload,
+        action: tradeTraceAction(payload.direction),
+      });
+    } catch (err) {
+      logger.error({ err, traceId: payload.traceId }, 'Failed to queue trade trace publication');
+    }
   }
 
   await logAgentAction('TRADER', 'INFO', 'TRADE_EXECUTED', payload.marketId, {
@@ -323,8 +329,6 @@ async function logAgentAction(
   data?: Record<string, unknown>,
 ): Promise<void> {
   try {
-    await prisma.agentLog.create({
-      data: { agentType, level, action, marketId: marketId ?? undefined, data: data as any },
-    });
+    await writeAgentLog({ agentType, level, action, marketId: marketId ?? undefined, data });
   } catch {}
 }

@@ -2,7 +2,9 @@ import axios from 'axios';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
 import { config } from '../config';
+import { secret } from '../config/secrets';
 import type { RawSignal, AggregatedSignals } from '../types';
+import { bulkheads, deadline } from '../lib/resilience';
 import dayjs from 'dayjs';
 
 const CACHE_TTL_MINUTES = 20; // Slightly longer than the 15-min cron interval to prevent expiry-at-fire races
@@ -40,56 +42,61 @@ async function cacheSignals(source: string, signals: RawSignal[]): Promise<void>
  * Fetches financial, political, sports, and entertainment signals from NewsAPI.
  * Results are cached for 15 minutes (matches cron interval).
  */
-export async function fetchNewsSignals(): Promise<RawSignal[]> {
+export async function fetchNewsSignals(signal?: AbortSignal): Promise<RawSignal[]> {
   const cached = await getCachedSignals('NEWSAPI');
   if (cached) {
     logger.debug('Using cached NewsAPI signals');
     return cached;
   }
 
-  if (!config.NEWSAPI_KEY) {
+  const newsApiKey = secret('NEWSAPI_KEY');
+  if (!newsApiKey) {
     logger.warn('NEWSAPI_KEY not set — skipping news ingestion');
     return [];
   }
 
-  try {
-    const { data } = await axios.get<{ articles: any[] }>(
-      'https://newsapi.org/v2/everything',
-      {
-        params: {
-          q: [
-            'Federal Reserve OR ECB OR inflation OR "interest rates" OR GDP',
-            'election OR parliament OR "political vote" OR president OR senate',
-            'geopolitical OR sanctions OR treaty OR conflict',
-            'bitcoin OR ethereum OR crypto OR "DeFi"',
-            '"championship" OR "World Cup" OR "NBA Finals" OR "Super Bowl" OR "Premier League"',
-            'Oscar OR Grammy OR Emmy OR "box office" OR "Billboard chart"',
-          ].join(' OR '),
-          language: 'en',
-          sortBy:   'publishedAt',
-          pageSize: 30,
-          apiKey:   config.NEWSAPI_KEY,
+  return bulkheads.datasource.run(async () => {
+    try {
+      const { data } = await axios.get<{ articles: any[] }>(
+        'https://newsapi.org/v2/everything',
+        {
+          params: {
+            q: [
+              'Federal Reserve OR ECB OR inflation OR "interest rates" OR GDP',
+              'election OR parliament OR "political vote" OR president OR senate',
+              'geopolitical OR sanctions OR treaty OR conflict',
+              'bitcoin OR ethereum OR crypto OR "DeFi"',
+              '"championship" OR "World Cup" OR "NBA Finals" OR "Super Bowl" OR "Premier League"',
+              'Oscar OR Grammy OR Emmy OR "box office" OR "Billboard chart"',
+            ].join(' OR '),
+            language: 'en',
+            sortBy:   'publishedAt',
+            pageSize: 30,
+            apiKey:   newsApiKey,
+          },
+          timeout: config.TIMEOUT_DATASOURCE_MS,
+          signal,
         },
-        timeout: 10_000,
-      },
-    );
+      );
 
-    const signals: RawSignal[] = (data.articles ?? []).map((article: any) => ({
-      source:         'NEWSAPI',
-      title:          article.title ?? '',
-      content:        article.description ?? article.content ?? '',
-      publishedAt:    article.publishedAt ?? new Date().toISOString(),
-      relevanceScore: 0.7,
-      category:       classifyNewsCategory(article.title ?? ''),
-    }));
+      const signals: RawSignal[] = (data.articles ?? []).map((article: any) => ({
+        source:         'NEWSAPI',
+        title:          article.title ?? '',
+        content:        article.description ?? article.content ?? '',
+        publishedAt:    article.publishedAt ?? new Date().toISOString(),
+        relevanceScore: 0.7,
+        category:       classifyNewsCategory(article.title ?? ''),
+      }));
 
-    await cacheSignals('NEWSAPI', signals);
-    logger.info({ count: signals.length }, 'Fetched news signals');
-    return signals;
-  } catch (err) {
-    logger.error({ err }, 'Failed to fetch NewsAPI signals');
-    return [];
-  }
+      await cacheSignals('NEWSAPI', signals);
+      logger.info({ count: signals.length }, 'Fetched news signals');
+      return signals;
+    } catch (err: any) {
+      if (signal?.aborted) throw signal.reason;
+      logger.error({ err: err?.message }, 'Failed to fetch NewsAPI signals');
+      return [];
+    }
+  }, signal);
 }
 
 // ─── FRED API ─────────────────────────────────────────────────────────────────
@@ -97,38 +104,49 @@ export async function fetchNewsSignals(): Promise<RawSignal[]> {
 /**
  * Fetches Federal Reserve economic data from FRED.
  * Series: FEDFUNDS, CPIAUCSL, UNRATE, T10Y2Y
+ * Series are fetched concurrently through bulkheads.datasource.
  */
-export async function fetchFedData(): Promise<RawSignal[]> {
+export async function fetchFedData(signal?: AbortSignal): Promise<RawSignal[]> {
   const cached = await getCachedSignals('FRED');
   if (cached) return cached;
 
-  const series  = ['FEDFUNDS', 'CPIAUCSL', 'UNRATE', 'T10Y2Y'];
-  const signals: RawSignal[] = [];
+  const series = ['FEDFUNDS', 'CPIAUCSL', 'UNRATE', 'T10Y2Y'];
+  const results = await Promise.allSettled(
+    series.map((seriesId) =>
+      bulkheads.datasource.run(async () => {
+        const fredApiKey = secret('FRED_API_KEY');
+        const apiKeyParam = fredApiKey ? `&api_key=${fredApiKey}` : '';
+        const url = `https://api.stlouisfed.org/fred/series/observations?series_id=${seriesId}&file_type=json&sort_order=desc&limit=2${apiKeyParam}`;
 
-  for (const seriesId of series) {
-    try {
-      const apiKeyParam = config.FRED_API_KEY ? `&api_key=${config.FRED_API_KEY}` : '';
-      const url = `https://api.stlouisfed.org/fred/series/observations?series_id=${seriesId}&file_type=json&sort_order=desc&limit=2${apiKeyParam}`;
-
-      const { data } = await axios.get<{ observations: any[] }>(url, { timeout: 10_000 });
-      const observations = data.observations ?? [];
-
-      if (observations.length > 0) {
-        const latest   = observations[0];
-        const previous = observations[1];
-        const change   = previous ? parseFloat(latest.value) - parseFloat(previous.value) : 0;
-
-        signals.push({
-          source:         'FRED',
-          title:          `${seriesId}: ${latest.value}`,
-          content:        `${seriesId} = ${latest.value} (${change >= 0 ? '+' : ''}${change.toFixed(3)} vs prior). Date: ${latest.date}`,
-          publishedAt:    new Date(latest.date).toISOString(),
-          relevanceScore: 0.9,
-          category:       'FED',
+        const { data } = await axios.get<{ observations: any[] }>(url, {
+          timeout: config.TIMEOUT_DATASOURCE_MS,
+          signal,
         });
-      }
-    } catch (err) {
-      logger.warn({ err, seriesId }, 'Failed to fetch FRED series');
+        const observations = data.observations ?? [];
+
+        if (observations.length > 0) {
+          const latest   = observations[0];
+          const previous = observations[1];
+          const change   = previous ? parseFloat(latest.value) - parseFloat(previous.value) : 0;
+
+          return {
+            source:         'FRED' as const,
+            title:          `${seriesId}: ${latest.value}`,
+            content:        `${seriesId} = ${latest.value} (${change >= 0 ? '+' : ''}${change.toFixed(3)} vs prior). Date: ${latest.date}`,
+            publishedAt:    new Date(latest.date).toISOString(),
+            relevanceScore: 0.9,
+            category:       'FED',
+          };
+        }
+        return null;
+      }, signal),
+    ),
+  );
+
+  const signals: RawSignal[] = [];
+  for (const r of results) {
+    if (r.status === 'fulfilled' && r.value) {
+      signals.push(r.value);
     }
   }
 
@@ -139,77 +157,67 @@ export async function fetchFedData(): Promise<RawSignal[]> {
 
 // ─── GDELT API ────────────────────────────────────────────────────────────────
 
-/**
- * Fetches geopolitical + macro events from GDELT.
- *
- * GDELT's public API is notoriously slow and unreliable — timeouts are the
- * norm, not the exception. Key changes from the previous implementation:
- *
- *  1. Hard timeout: 8 seconds (down from 25s). If GDELT hasn't responded
- *     in 8s it never will for this cycle.
- *  2. Single attempt only: retrying a slow/overloaded endpoint just doubles
- *     the delay. We treat a timeout as "no macro signals this cycle" and move on.
- *  3. Promise.race with an internal deadline: guarantees we never block
- *     aggregateSignals() for longer than GDELT_TIMEOUT_MS.
- *  4. Logged as DEBUG on timeout (not WARN) to reduce log noise — GDELT
- *     timeouts are expected and non-actionable.
- */
-
 const GDELT_TIMEOUT_MS = 8_000;
 
-export async function fetchMacroEvents(): Promise<RawSignal[]> {
+export async function fetchMacroEvents(signal?: AbortSignal): Promise<RawSignal[]> {
   const cached = await getCachedSignals('GDELT');
   if (cached) {
     logger.debug('Using cached GDELT signals');
     return cached;
   }
 
-  const deadline = new Promise<RawSignal[]>((_, reject) =>
-    setTimeout(() => reject(new Error('GDELT deadline exceeded')), GDELT_TIMEOUT_MS),
-  );
-
-  const fetch = async (): Promise<RawSignal[]> => {
-    const { data } = await axios.get(
-      'https://api.gdeltproject.org/api/v2/doc/doc',
-      {
-        params: {
-          query:      '"central bank" OR "interest rate" OR inflation OR election OR geopolitical',
-          mode:       'artlist',
-          format:     'json',
-          maxrecords: 10,
-          timespan:   '1440',
-        },
-        timeout: GDELT_TIMEOUT_MS,
-      },
-    );
-
-    const articles: any[] = data?.articles ?? [];
-    const signals: RawSignal[] = articles.map((a: any) => ({
-      source:         'GDELT',
-      title:          a.title ?? '',
-      content:        a.url ?? '',
-      publishedAt:    a.seendate ?? new Date().toISOString(),
-      relevanceScore: 0.6,
-      category:       classifyNewsCategory(a.title ?? ''),
-    }));
-
-    if (signals.length > 0) {
-      await cacheSignals('GDELT', signals);
-      logger.info({ count: signals.length }, 'Fetched GDELT signals');
-    }
-    return signals;
-  };
+  const handle = deadline('datasource', signal, GDELT_TIMEOUT_MS);
 
   try {
-    return await Promise.race([fetch(), deadline]);
-  } catch (err: any) {
-    const isTimeout = err?.message?.includes('deadline') || err?.code === 'ECONNABORTED';
-    if (isTimeout) {
-      logger.debug('GDELT timed out — continuing without macro signals this cycle');
-    } else {
-      logger.warn({ err: err?.message }, 'GDELT fetch failed — continuing without macro signals');
-    }
-    return [];
+    return await bulkheads.datasource.run(async () => {
+      try {
+        const { data } = await axios.get(
+          'https://api.gdeltproject.org/api/v2/doc/doc',
+          {
+            params: {
+              query:      '"central bank" OR "interest rate" OR inflation OR election OR geopolitical',
+              mode:       'artlist',
+              format:     'json',
+              maxrecords: 10,
+              timespan:   '1440',
+            },
+            timeout: GDELT_TIMEOUT_MS,
+            signal: handle.signal,
+          },
+        );
+
+        const articles: any[] = data?.articles ?? [];
+        const signals: RawSignal[] = articles.map((a: any) => ({
+          source:         'GDELT',
+          title:          a.title ?? '',
+          content:        a.url ?? '',
+          publishedAt:    a.seendate ?? new Date().toISOString(),
+          relevanceScore: 0.6,
+          category:       classifyNewsCategory(a.title ?? ''),
+        }));
+
+        if (signals.length > 0) {
+          await cacheSignals('GDELT', signals);
+          logger.info({ count: signals.length }, 'Fetched GDELT signals');
+        }
+        return signals;
+      } catch (err: any) {
+        const isTimeout =
+          handle.signal.aborted ||
+          err?.code === 'ECONNABORTED' ||
+          err?.code === 'ERR_CANCELED' ||
+          err?.message?.includes('aborted');
+
+        if (isTimeout) {
+          logger.debug('GDELT timed out — continuing without macro signals this cycle');
+        } else {
+          logger.warn({ err: err?.message }, 'GDELT fetch failed — continuing without macro signals');
+        }
+        return [];
+      }
+    }, handle.signal);
+  } finally {
+    handle.cleanup?.();
   }
 }
 
@@ -222,11 +230,11 @@ export async function fetchMacroEvents(): Promise<RawSignal[]> {
  * source never blocks the others. GDELT is the most likely to fail; the
  * market maker cycle proceeds normally with news + FRED alone.
  */
-export async function aggregateSignals(): Promise<AggregatedSignals> {
+export async function aggregateSignals(signal?: AbortSignal): Promise<AggregatedSignals> {
   const [newsRaw, fedRaw, macroRaw] = await Promise.allSettled([
-    fetchNewsSignals(),
-    fetchFedData(),
-    fetchMacroEvents(),
+    fetchNewsSignals(signal),
+    fetchFedData(signal),
+    fetchMacroEvents(signal),
   ]);
 
   const news  = newsRaw.status  === 'fulfilled' ? newsRaw.value  : [];
@@ -248,31 +256,15 @@ function classifyNewsCategory(title: string): string {
     return 'FED';
   if (t.includes('ecb') || t.includes('european central bank') || t.includes('lagarde'))
     return 'ECB';
-  if (t.includes('election') || t.includes('ballot') || t.includes('polling') || t.includes('vote result'))
+  if (t.includes('election') || t.includes('senate') || t.includes('president') || t.includes('parliament') || t.includes('vote'))
     return 'ELECTION';
-  if (t.includes('bitcoin') || t.includes('btc') || t.includes('ethereum') || t.includes('crypto') || t.includes('defi') || t.includes('nft'))
+  if (t.includes('sanctions') || t.includes('treaty') || t.includes('conflict') || t.includes('geopolitical') || t.includes('war'))
+    return 'GEOPOLITICAL';
+  if (t.includes('bitcoin') || t.includes('ethereum') || t.includes('crypto') || t.includes('defi'))
     return 'CRYPTO';
-  if (
-    t.includes('nba') || t.includes('nfl') || t.includes('fifa') || t.includes('premier league') ||
-    t.includes('world cup') || t.includes('championship') || t.includes('super bowl') ||
-    t.includes('wimbledon') || t.includes('formula 1') || t.includes('f1 ') ||
-    t.includes('olympics') || t.includes('tournament') || t.includes(' cup ')
-  ) return 'SPORTS';
-  if (
-    t.includes('oscar') || t.includes('grammy') || t.includes('emmy') || t.includes('bafta') ||
-    t.includes('box office') || t.includes('billboard') || t.includes('movie release') ||
-    t.includes('album') || t.includes('celebrity') || t.includes('hollywood')
-  ) return 'ENTERTAINMENT';
-  if (
-    t.includes('president') || t.includes('congress') || t.includes('parliament') ||
-    t.includes('senate') || t.includes('minister') || t.includes('legislation') ||
-    t.includes('political party') || t.includes('policy bill') || t.includes('cabinet')
-  ) return 'POLITICS';
-  if (
-    t.includes('war') || t.includes('sanction') || t.includes('treaty') ||
-    t.includes('geopolit') || t.includes('conflict') || t.includes('nato') ||
-    t.includes('un security') || t.includes('diplomatic')
-  ) return 'GEOPOLITICAL';
-
+  if (t.includes('nba') || t.includes('world cup') || t.includes('super bowl') || t.includes('premier league') || t.includes('championship'))
+    return 'SPORTS';
+  if (t.includes('oscar') || t.includes('grammy') || t.includes('emmy') || t.includes('box office') || t.includes('billboard'))
+    return 'ENTERTAINMENT';
   return 'MACRO';
 }

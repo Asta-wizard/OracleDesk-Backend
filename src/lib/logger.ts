@@ -1,5 +1,6 @@
 import pino from 'pino';
 import { config } from '../config';
+import { correlation, currentContext } from './context';
 
 export const logger = pino({
   level: config.NODE_ENV === 'production' ? 'info' : 'debug',
@@ -11,9 +12,16 @@ export const logger = pino({
             colorize: true,
             translateTime: 'SYS:standard',
             ignore: 'pid,hostname',
+            messageFormat: '{if requestId}[{requestId}] {end}{msg}',
           },
         }
       : undefined,
+  // Every line emitted inside a request/cron/job context carries its ids.
+  mixin() {
+    const ctx = currentContext();
+    if (!ctx) return {};
+    return { ...correlation(), kind: ctx.kind, ...(ctx.userId ? { userId: ctx.userId } : {}) };
+  },
   // Never log credentials, even if a caller passes a whole request or config.
   redact: {
     paths: [

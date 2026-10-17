@@ -2,7 +2,8 @@
 
 import { z } from "zod";
 import { prisma } from "../lib/prisma";
-import { completeLLM } from '../lib/llm';
+import { writeAgentLog } from "../lib/agent-log";
+import { callLLMJSON } from '../lib/llm';
 import { logger } from "../lib/logger";
 import type {
   MarketProposal,
@@ -396,9 +397,7 @@ async function logAgentAction(
   data?:     Record<string, unknown>,
 ): Promise<void> {
   try {
-    await prisma.agentLog.create({
-      data: { agentType, level, action, marketId: marketId ?? undefined, data: data as any },
-    });
+    await writeAgentLog({ agentType, level, action, marketId: marketId ?? undefined, data });
   } catch (err) {
     logger.error({ err }, "Failed to write agent log");
   }

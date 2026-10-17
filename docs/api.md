@@ -4,7 +4,7 @@ This is the contract between `OracleDesk-Frontend` and this backend. The
 Soroban contracts in `OracleDesk-SmartContract/oracledesk-stellar` are the
 source of truth for anything on-chain; this API never overrides them.
 
-Base URL: `/api/v1` (health is at `/health`).
+Base URL: `/api/v1` (liveness is `/livez`, readiness is `/readyz`).
 
 ## Conventions
 
@@ -14,8 +14,10 @@ Every response, success or error:
 
 ```json
 { "ok": true,  "data": { }, "error": null, "meta": { } }
-{ "ok": false, "data": null, "error": { "code": "SOME_CODE", "message": "Readable text", "details": { } } }
+{ "ok": false, "data": null, "error": { "code": "SOME_CODE", "message": "Readable text", "details": { }, "requestId": "req_018f..." } }
 ```
+
+Every response carries an `X-Request-Id` header (exposed via CORS), and error envelopes repeat it as `error.requestId`; quote it when reporting a problem. A client may send its own `X-Request-Id` (8 to 64 characters of `A-Z a-z 0-9 . _ : -`); any other value is ignored and a new id is generated.
 
 `meta` is optional. List endpoints put pagination there:
 `{ "page": 1, "limit": 20, "total": 57, "totalPages": 3 }`.
@@ -72,11 +74,68 @@ removes the enum value. `settlementCurrency` stays in responses (always
 `"USDC"`) so the frontend doesn't break; the `currency` filter on
 `GET /markets` accepts only `USDC`.
 
+## Idempotency
+
+State-changing endpoints accept an `Idempotency-Key` header
+([draft-ietf-httpapi-idempotency-key-header](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/),
+the same model as Stripe). Generate one key per **logical operation** and send
+the same key on every retry of it.
+
+| Route | Header |
+|---|---|
+| `POST /markets/generate` | **required** |
+| `POST /trade/copy` | **required** |
+| `PATCH /trade/copy/:id/confirm` | optional |
+| `PUT /traces/access/allowance` | optional |
+| `POST /traces/verify` | optional |
+| `POST /traces/:id/unlock` | optional |
+| `POST /auth/challenge`, `POST /auth/verify` | not supported (the handshake is single-use, and `/auth/verify` returns a JWT that is never stored) |
+
+- **Format:** 1–255 printable ASCII characters. A UUID (`crypto.randomUUID()`) is recommended.
+- **Scope:** `(user, method, route template, key)`. The same key from another user or on another route never collides.
+- **TTL:** 24 h. Expired keys are purged hourly.
+- **Fingerprint:** sha256 of the canonical `{ method, route, params, query, body }` (keys sorted, so JSON key order and query-parameter order don't matter).
+
+**Responses**
+
+| Situation | Result |
+|---|---|
+| First request | Runs normally. Its 2xx/4xx response is stored. |
+| Exact retry after it finished | The stored status and body are replayed with `Idempotent-Replayed: true`. The handler does **not** run again (e.g. `POST /markets/generate` returns the original `jobId` and starts no new cycle). |
+| Retry while the first is still running | `409 IDEMPOTENCY_IN_PROGRESS` with `Retry-After: 1` |
+| Same key, different request | `422 IDEMPOTENCY_KEY_MISMATCH` |
+| Missing key on a required route | `400 IDEMPOTENCY_KEY_REQUIRED` |
+| Malformed key | `400 IDEMPOTENCY_KEY_INVALID` |
+| Original response was > 64 KB | `409 IDEMPOTENCY_RESPONSE_UNAVAILABLE` (use a new key) |
+
+- **5xx responses are not stored.** The key is released so a retry runs again. If a handler commits a side effect and *then* fails with a 5xx, a retry re-executes it, so such handlers must make the effect itself idempotent (as `recordPayment` does for a duplicate `txHash`).
+- A stored **4xx is replayed as-is**, even if state has changed since (e.g. a `403 TRACE_LOCKED` replays after the user buys a pass). After changing state, use a **new** key.
+- A request that crashed mid-flight holds its key for 60 s, after which a retry takes it over.
+- Only `Content-Type`, `Location` and `API-Version` are replayed. `Set-Cookie`/`Authorization` are never stored, and body fields named like `token`/`secret`/`authorization` are redacted before storage.
+
+**Frontend:** create the key when the user starts the action, and reuse it across React Query retries:
+
+```ts
+const key = crypto.randomUUID();             // once per logical action, e.g. per click
+useMutation({
+  mutationKey: ['copy-trade', key],
+  mutationFn: (vars) =>
+    api.post('/trade/copy', vars, { headers: { 'Idempotency-Key': key } }),
+  retry: 3,                                  // retries reuse the same key
+});
+```
+
 ## Endpoints
 
 ### Health
 
-`GET /health` → `{ status: "healthy", uptime: number }`
+`GET /livez` → `{ status: "alive" }`. Process health only (event-loop delay, fatal flag); never touches a dependency, so an outage cannot restart every instance. `503 NOT_ALIVE` when the loop is stalled.
+
+`GET /readyz` → `200 { status: "ready", checks }` when every critical dependency is up, `503 NOT_READY` with `status: "not_ready"` otherwise, or `status: "draining"` once shutdown has begun. Each check is `{ name, ok, critical, latencyMs, error? }` for `database`, `redis`, `rpc` and `indexer`; `error` is one of `timeout`, `connection_refused`, `rpc_unhealthy`, `lagging`, `unavailable`. Probes time out after `HEALTH_PROBE_TIMEOUT_MS`, results are cached for `HEALTH_CACHE_TTL_MS` (failures for 500 ms) and concurrent calls share one run. `HEALTH_CRITICAL` (default `database,redis`) picks which dependencies fail readiness. Both endpoints bypass the rate limiter.
+
+`GET /health` → `{ status: "healthy", uptime: number }`. Deprecated: it sends `Deprecation: true` and `Link: </readyz>; rel="successor-version"`.
+
+`GET /api/v1/admin/status` (admin JWT) → probe details with latencies, indexer cursor vs RPC latest ledger and lag, last success/failure per cron job (in memory, reset on restart), chain execution mode, agent public key, LLM provider configuration and Gemini breaker state, and process info.
 
 ### Auth (signed challenge, SEP-10 style)
 
@@ -275,6 +334,7 @@ was simulated, not submitted.
   "marketProbability": 0.5,
   "confidenceInterval": { "lower": 0.55, "upper": 0.7 },
   "verified": true,
+  "audit": { "status": "VERIFIED", "checkedAt": "…" },
   "ipfsCid": "bafy…",
   "traceHash": "64-hex",
   "onChainTraceId": "3",
@@ -415,7 +475,8 @@ and `trade { direction, amount, edgeDetected, kellyFraction, txHash }`.
 #### `GET /portfolio/stats`
 
 Platform counts from the database only:
-`{ subscriberCount, totalCopyVolume, builderFees, marketCount, onChainMarketCount, traceCount }`.
+`{ subscriberCount, totalCopyVolume, totalCopyVolumeRaw, builderFees, marketCount, onChainMarketCount, traceCount }`.
+`totalCopyVolumeRaw` is the exact base-unit sum of `collateralRaw` for verified `EXECUTED` copy trades as a decimal string.
 The version in the unpushed commit `207464d` padded these with constants
 (`+1284` subscribers, `+142000` volume); this one doesn't.
 
@@ -432,6 +493,7 @@ Response:
 ```json
 {
   "copyTradeId": "uuid",
+  "expiresAt": "2026-10-17T03:30:00.000Z",
   "transactionPayload": {
     "contractId": "C… (market-core)",
     "onChainMarketId": "0",
@@ -440,19 +502,48 @@ Response:
     "userWallet": "G…",
     "traceReference": "bafy…"
   },
-  "instructions": "Quote, then sign market_core.buy with min_shares_out from the quote."
+  "instructions": "Quote, then sign market_core.buy with min_shares_out from the quote. Then call PATCH /trade/copy/:id/confirm with the transaction hash."
 }
 ```
 
 The direction comes from the trace's edge. The server refuses when there's
-no trace, the edge is zero, or the market has no `onChainMarketId`
-(`409 MARKET_NOT_ON_CHAIN`, `422 NO_EDGE`). `min_shares_out` isn't in the
-payload because it must come from a quote taken right before signing.
+no trace, the edge is zero, the market has no `onChainMarketId`
+(`409 MARKET_NOT_ON_CHAIN`, `422 NO_EDGE`), or the user has reached the open copy trade
+limit (`429 COPY_TRADE_LIMIT_REACHED` when ≥ `COPY_TRADE_MAX_PENDING` open trades exist).
+Unconfirmed trades expire after `COPY_TRADE_TTL_MINUTES` (default 30).
+`min_shares_out` isn't in the payload because it must come from a quote taken right before signing.
 
 #### `PATCH /trade/copy/:id/confirm` (auth)
 
-Request `{ txHash }`. Stored as `EXECUTED`; the indexer reconciles it against
-the market-core `trade` event.
+Request `{ "txHash": "64-hex" }`.
+
+The backend verifies the transaction on-chain via Stellar RPC:
+- Checks that the transaction succeeded.
+- Decodes contract events emitted by `CONTRACTS.marketCore`.
+- Asserts that a `Trade` event exists for the user's wallet (`trader`), the copy trade's `onChainMarketId`, the requested outcome, and `is_buy: true`.
+- Asserts that executed `collateral` does not exceed `amountRaw`.
+- Checks the transaction envelope (direct `marketCore.buy` call or smart wallet routing).
+- Re-use of a `txHash` across multiple copy trades is forbidden and returns `409 COPY_TRADE_TX_ALREADY_USED`.
+
+If the transaction has not yet been indexed or seen by Stellar RPC, the endpoint returns:
+`202 Accepted` with `{ "status": "CONFIRMING", "retryAfterSeconds": 5 }`.
+Pending / confirming copy trades are automatically reconciled when the indexer receives the `Trade` event, or during the 5-minute background sweep.
+
+Once confirmed, the copy trade is stored with `status: "EXECUTED"`, and records `collateralRaw`, `sharesRaw`, `feeRaw`, `ledger`, `chainEventId`, and `confirmedAt` directly from the on-chain event.
+
+### Admin (admin auth)
+
+Admin routes require a valid JWT whose `walletAddress` is present in `ADMIN_ADDRESSES`.
+
+#### `GET /admin/trace-audit` (admin)
+
+Returns summary metrics across all trace audits, details of the latest audit run, and paginated non-verified findings.
+Query parameters: `page`, `limit`, `status`.
+
+#### `POST /admin/trace-audit/run` (admin)
+
+Schedules a trace audit run asynchronously in the background.
+Response `202 Accepted`: `{ "runId": "uuid", "message": "Trace audit run scheduled" }`.
 
 ### Oracle / resolution
 
@@ -592,9 +683,16 @@ The old payload had `amount` (float USDC), `price` (0–1) and `probChange`
 (string). Frontends derive display values from `collateralRaw` and
 `priceYesBps`.
 
+> A trace's `verified` flag means its `trace_hash` was confirmed on-chain: set
+> by the indexer when it sees the matching `TracePublished` event (or by
+> `POST /traces/verify`), never from a write result alone and never in dry-run.
+
 ### `REASONING_PUBLISHED`
 
 Emitted when the indexer stores a reasoning-registry publish event.
+`action` is one of the backend's `create_market`, `buy_yes`, `buy_no`
+(`src/lib/trace-actions.ts`); traces published by other agents may use other
+strings, such as `buy` from the contracts repo's TypeScript agents.
 
 ```json
 {
@@ -602,7 +700,7 @@ Emitted when the indexer stores a reasoning-registry publish event.
   "onChainMarketId": "0",
   "traceId": "uuid or null",
   "agent": "G…",
-  "action": "buy",
+  "action": "buy_yes",
   "ipfsCid": "bafy…",
   "traceHash": "64-hex",
   "txHash": "64-hex",

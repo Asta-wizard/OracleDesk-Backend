@@ -1,7 +1,9 @@
 import type { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { config } from '../config';
+import { previousSecret, secret, secretEntry } from '../config/secrets';
 import { sendError } from '../utils/response.util';
+import { currentContext } from '../lib/context';
 
 export interface JwtPayload {
   userId: string;
@@ -22,11 +24,28 @@ declare global {
 function decode(req: Request): { user?: JwtPayload; error?: 'missing' | 'expired' | 'invalid' } {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith('Bearer ')) return { error: 'missing' };
+  const token = authHeader.slice(7);
   try {
-    return { user: jwt.verify(authHeader.slice(7), config.JWT_SECRET) as JwtPayload };
+    return { user: jwt.verify(token, secret('JWT_SECRET')) as JwtPayload };
   } catch (err) {
-    return { error: err instanceof jwt.TokenExpiredError ? 'expired' : 'invalid' };
+    // Expiry is a property of the token, not the key. Never retry it with the
+    // previous secret: that would turn an expired token into a valid one.
+    if (err instanceof jwt.TokenExpiredError) return { error: 'expired' };
+    if (!(err instanceof jwt.JsonWebTokenError)) return { error: 'invalid' };
+    const previous = previousSecret('JWT_SECRET');
+    if (!previous) return { error: 'invalid' };
+    try {
+      return { user: jwt.verify(token, previous) as JwtPayload };
+    } catch {
+      return { error: 'invalid' };
+    }
   }
+}
+
+/** Tag the request's log context with the caller (mutates this request's own store object). */
+function setContextUser(userId: string): void {
+  const ctx = currentContext();
+  if (ctx) ctx.userId = userId;
 }
 
 /**
@@ -36,6 +55,7 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
   const { user, error } = decode(req);
   if (user) {
     req.user = user;
+    setContextUser(user.userId);
     next();
     return;
   }
@@ -47,7 +67,10 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
 /** Attaches req.user when a valid token is present; never rejects. */
 export function optionalAuth(req: Request, _res: Response, next: NextFunction): void {
   const { user } = decode(req);
-  if (user) req.user = user;
+  if (user) {
+    req.user = user;
+    setContextUser(user.userId);
+  }
   next();
 }
 
@@ -67,5 +90,5 @@ export function requireAdmin(req: Request, res: Response, next: NextFunction): v
  * Generate a signed JWT for a user
  */
 export function signToken(userId: string, walletAddress: string): string {
-  return jwt.sign({ userId, walletAddress }, config.JWT_SECRET, { expiresIn: '7d' });
+  return jwt.sign({ userId, walletAddress }, secret('JWT_SECRET'), { expiresIn: '7d' });
 }

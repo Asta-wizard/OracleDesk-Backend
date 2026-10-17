@@ -20,11 +20,14 @@ import type { AssembledTransaction } from '@stellar/stellar-sdk/contract';
 import { config } from '../config';
 import { logger } from '../lib/logger';
 import { agentClients, readClients } from './stellar/clients';
-import { ChainError, contractErrorName } from './stellar/errors';
-import type { Category, Config as MarketCoreConfig, Market as OnChainMarket, Outcome, Position } from '../generated/market-core';
+import { ChainError, contractErrorName, ArchivedEntryError } from './stellar/errors';
+import { withTimeout, TimeoutError } from '../lib/resilience';
+import type { Category, Market as OnChainMarket, Outcome, Position } from '../generated/market-core';
 import type { Trace } from '../generated/reasoning-registry';
 import type { DailyUsage, RiskConfig } from '../generated/treasury';
 import type { ResolutionState } from '../generated/resolver';
+
+export { ArchivedEntryError };
 
 type ContractKey = 'marketCore' | 'treasury' | 'resolver' | 'reasoningRegistry';
 
@@ -41,16 +44,28 @@ export const Outcomes = {
 export function simulatedValue<T>(contract: ContractKey, method: string, tx: AssembledTransaction<unknown>): T {
   const sim = tx.simulation as { error?: string } | undefined;
   const hostError = typeof sim?.error === 'string' ? sim.error : undefined;
+  if (hostError && /archived|restore/i.test(hostError)) {
+    throw new ArchivedEntryError(`Simulation failed due to archived state: ${hostError}`, { method });
+  }
+
   let raw: unknown;
   try {
     raw = tx.result;
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/archived|restore/i.test(msg)) {
+      throw new ArchivedEntryError(`Simulation failed due to archived state: ${msg}`, { method });
+    }
     throw new ChainError(`${method} simulation failed`, contractErrorName(contract, err, hostError), { method });
   }
+
   if (raw && typeof raw === 'object' && 'isOk' in raw && typeof (raw as { isOk: unknown }).isOk === 'function') {
     const result = raw as { isOk(): boolean; unwrap(): T };
     if (!result.isOk()) {
       const name = contractErrorName(contract, raw, hostError);
+      if (name && /archived|restore/i.test(name)) {
+        throw new ArchivedEntryError(`Contract entry is archived: ${name}`, { method, contractError: name });
+      }
       throw new ChainError(`${method} failed: ${name ?? 'contract error'}`, name, { method });
     }
     return result.unwrap();
@@ -58,17 +73,32 @@ export function simulatedValue<T>(contract: ContractKey, method: string, tx: Ass
   return raw as T;
 }
 
-async function read<T>(contract: ContractKey, method: string, call: () => Promise<AssembledTransaction<unknown>>): Promise<T> {
-  let tx: AssembledTransaction<unknown>;
-  try {
-    tx = await call();
-  } catch (err) {
-    throw new ChainError(`${method} read failed`, contractErrorName(contract, err), {
-      method,
-      cause: err instanceof Error ? err.message : String(err),
-    });
-  }
-  return simulatedValue<T>(contract, method, tx);
+async function read<T>(
+  contract: ContractKey,
+  method: string,
+  call: () => Promise<AssembledTransaction<unknown>>,
+  signal?: AbortSignal,
+): Promise<T> {
+  return withTimeout(
+    'rpc-read',
+    async () => {
+      let tx: AssembledTransaction<unknown>;
+      try {
+        tx = await call();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/archived|restore/i.test(msg)) {
+          throw new ArchivedEntryError(`Simulation failed due to archived state: ${msg}`, { method });
+        }
+        throw new ChainError(`${method} read failed`, contractErrorName(contract, err), {
+          method,
+          cause: msg,
+        });
+      }
+      return simulatedValue<T>(contract, method, tx);
+    },
+    { signal },
+  );
 }
 
 async function write<T>(
@@ -76,6 +106,7 @@ async function write<T>(
   method: string,
   args: Record<string, unknown>,
   call: () => Promise<AssembledTransaction<unknown>>,
+  signal?: AbortSignal,
 ): Promise<WriteResult<T>> {
   let tx: AssembledTransaction<unknown>;
   try {
@@ -93,13 +124,29 @@ async function write<T>(
     return { mode: 'dry-run', method, value: simulated, txHash: null };
   }
 
+  let txHash: string | null = null;
   try {
-    const sent = await tx.signAndSend();
+    const rawTx = tx as any;
+    if (typeof rawTx?.built?.hash === 'function') {
+      txHash = rawTx.built.hash().toString('hex');
+    }
+  } catch {}
+
+  try {
+    const sent = await withTimeout('rpc-write', async () => tx.signAndSend(), { signal });
     const value = simulatedValueFromSent<T>(contract, method, sent.result);
-    const txHash = sent.sendTransactionResponse?.hash ?? null;
-    logger.info({ method, txHash }, 'submitted');
-    return { mode: 'live', method, value, txHash };
-  } catch (err) {
+    const finalHash = sent.sendTransactionResponse?.hash ?? txHash;
+    logger.info({ method, txHash: finalHash }, 'submitted');
+    return { mode: 'live', method, value, txHash: finalHash };
+  } catch (err: any) {
+    if (err instanceof TimeoutError || err?.code === 'UPSTREAM_TIMEOUT') {
+      throw new ChainError(
+        `${method} submission timed out`,
+        null,
+        { outcome: 'unknown', txHash },
+        'CHAIN_SUBMISSION_TIMEOUT',
+      );
+    }
     throw new ChainError(`${method} submission failed`, contractErrorName(contract, err), {
       method,
       cause: err instanceof Error ? err.message : String(err),
@@ -129,33 +176,60 @@ export function printable(value: unknown): unknown {
 
 // ─── Reads ────────────────────────────────────────────────────────────────
 
-export const marketCount = () =>
-  read<bigint>('marketCore', 'market_count', async () => (await readClients.marketCore()).market_count());
+export const marketCount = (signal?: AbortSignal) =>
+  read<bigint>('marketCore', 'market_count', async () => (await readClients.marketCore()).market_count(), signal);
 
-export const getOnChainMarket = (marketId: bigint) =>
-  read<OnChainMarket>('marketCore', 'get_market', async () => readClients.marketCore().get_market({ market_id: marketId }));
+export const getOnChainMarket = (marketId: bigint, signal?: AbortSignal) =>
+  read<OnChainMarket>('marketCore', 'get_market', async () => readClients.marketCore().get_market({ market_id: marketId }), signal);
 
-export const getPrice = (marketId: bigint, outcome: Outcome) =>
-  read<number>('marketCore', 'get_price', async () => readClients.marketCore().get_price({ market_id: marketId, outcome }));
+export const getPrice = (marketId: bigint, outcome: Outcome, signal?: AbortSignal) =>
+  read<number>('marketCore', 'get_price', async () => readClients.marketCore().get_price({ market_id: marketId, outcome }), signal);
 
-export const quoteBuy = (marketId: bigint, outcome: Outcome, collateralIn: bigint) =>
+export const quoteBuy = (marketId: bigint, outcome: Outcome, collateralIn: bigint, signal?: AbortSignal) =>
   read<bigint>('marketCore', 'quote_buy', async () =>
-    readClients.marketCore().quote_buy({ market_id: marketId, outcome, collateral_in: collateralIn }),
+    readClients.marketCore().quote_buy({ market_id: marketId, outcome, collateral_in: collateralIn }), signal,
   );
 
-export const getPosition = (marketId: bigint, holder: string) =>
+export const getPosition = (marketId: bigint, holder: string, signal?: AbortSignal) =>
   read<Position>('marketCore', 'get_position', async () =>
-    readClients.marketCore().get_position({ market_id: marketId, holder }),
+    readClients.marketCore().get_position({ market_id: marketId, holder }), signal,
   );
 
-export const getOnChainTrace = (traceId: bigint) =>
-  read<Trace>('reasoningRegistry', 'get_trace', async () => readClients.reasoningRegistry().get_trace({ trace_id: traceId }));
+export const getOnChainTrace = (traceId: bigint, signal?: AbortSignal) =>
+  read<Trace>('reasoningRegistry', 'get_trace', async () => readClients.reasoningRegistry().get_trace({ trace_id: traceId }), signal);
 
-export const resolverState = (marketId: bigint) =>
-  read<ResolutionState>('resolver', 'state', async () => readClients.resolver().state({ market_id: marketId }));
+export const getOnChainTraceOrNull = async (traceId: bigint, signal?: AbortSignal): Promise<Trace | null> => {
+  try {
+    return await getOnChainTrace(traceId, signal);
+  } catch (err: any) {
+    if (
+      err instanceof ChainError &&
+      (err.contractError === 'TraceNotFound' ||
+        err.message.includes('TraceNotFound') ||
+        err.message.includes('#5'))
+    ) {
+      return null;
+    }
+    throw err;
+  }
+};
 
-export const treasuryAvailableCapital = () =>
-  read<bigint>('treasury', 'available_capital', async () => readClients.treasury().available_capital());
+export const traceCount = (signal?: AbortSignal) =>
+  read<bigint>('reasoningRegistry', 'trace_count', async () => readClients.reasoningRegistry().trace_count(), signal);
+
+export const marketTraceCount = (marketId: bigint, signal?: AbortSignal) =>
+  read<bigint>('reasoningRegistry', 'market_trace_count', async () =>
+    readClients.reasoningRegistry().market_trace_count({ market_id: marketId }), signal);
+
+export const marketTraceAt = (marketId: bigint, index: bigint, signal?: AbortSignal) =>
+  read<bigint>('reasoningRegistry', 'market_trace_at', async () =>
+    readClients.reasoningRegistry().market_trace_at({ market_id: marketId, index }), signal);
+
+export const resolverState = (marketId: bigint, signal?: AbortSignal) =>
+  read<ResolutionState>('resolver', 'state', async () => readClients.resolver().state({ market_id: marketId }), signal);
+
+export const treasuryAvailableCapital = (signal?: AbortSignal) =>
+  read<bigint>('treasury', 'available_capital', async () => readClients.treasury().available_capital(), signal);
 
 export const treasuryConfig = () =>
   read<RiskConfig>('treasury', 'get_config', async () => readClients.treasury().get_config());
@@ -178,16 +252,16 @@ export interface CreateMarketArgs {
   initial_yes_bps: number;
 }
 
-export const agentCreateMarket = (args: CreateMarketArgs) =>
+export const agentCreateMarket = (args: CreateMarketArgs, signal?: AbortSignal) =>
   write<bigint>('treasury', 'agent_create_market', { ...args }, async () =>
-    agentClients.treasury().agent_create_market(args),
+    agentClients.treasury().agent_create_market(args), signal,
   );
 
-export const agentBuy = (args: { market_id: bigint; outcome: Outcome; collateral_in: bigint; min_shares_out: bigint }) =>
-  write<bigint>('treasury', 'agent_buy', args, async () => agentClients.treasury().agent_buy(args));
+export const agentBuy = (args: { market_id: bigint; outcome: Outcome; collateral_in: bigint; min_shares_out: bigint }, signal?: AbortSignal) =>
+  write<bigint>('treasury', 'agent_buy', args, async () => agentClients.treasury().agent_buy(args), signal);
 
-export const agentSell = (args: { market_id: bigint; outcome: Outcome; collateral_out: bigint; max_shares_in: bigint }) =>
-  write<bigint>('treasury', 'agent_sell', args, async () => agentClients.treasury().agent_sell(args));
+export const agentSell = (args: { market_id: bigint; outcome: Outcome; collateral_out: bigint; max_shares_in: bigint }, signal?: AbortSignal) =>
+  write<bigint>('treasury', 'agent_sell', args, async () => agentClients.treasury().agent_sell(args), signal);
 
 export const publishTrace = (args: {
   agent: string;
@@ -195,7 +269,7 @@ export const publishTrace = (args: {
   action: string;
   trace_hash: Buffer;
   ipfs_cid: string;
-}) =>
+}, signal?: AbortSignal) =>
   write<bigint>('reasoningRegistry', 'publish_trace', args, async () =>
-    agentClients.reasoningRegistry().publish_trace(args),
+    agentClients.reasoningRegistry().publish_trace(args), signal,
   );

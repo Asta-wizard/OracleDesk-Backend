@@ -5,7 +5,11 @@ import { checkCorrelation } from '../services/correlation.service';
 import { generateReasoningTrace } from '../services/reasoning.service';
 import { detectHedgeOpportunities, autoHedge, checkDailyDrawdown, enforceStopLoss } from '../services/hedging.service';
 import { prisma } from '../lib/prisma';
+import { writeAgentLog } from '../lib/agent-log';
 import { logger } from '../lib/logger';
+import { config } from '../config';
+import { deadline } from '../lib/resilience';
+import { shutdownController } from '../lib/shutdown';
 
 const BANKROLL = 10_000;  // $10,000 USDC starting bankroll
 const MIN_MARKET_LIQUIDITY = 500;
@@ -24,10 +28,19 @@ const MIN_EDGE = 0.08;
  *   5. For each mispriced market: compute Kelly size, check correlation, execute
  *   6. Generate reasoning trace + pin to IPFS for each trade
  */
-export async function runTraderCycle(): Promise<void> {
+export async function runTraderCycle(opts?: { signal?: AbortSignal }): Promise<void> {
   logger.info('Trader Agent: starting cycle');
 
+  const parentSignal = opts?.signal
+    ? opts.signal
+    : shutdownController.signal;
+
+  const handle = deadline('rpc-write', parentSignal, config.CYCLE_DEADLINE_MS);
+  const signal = handle.signal;
+
   try {
+    signal.throwIfAborted();
+
     // Step 1: Check daily drawdown limit
     const drawdown = await checkDailyDrawdown(BANKROLL);
     if (drawdown.isPaused) {
@@ -35,12 +48,15 @@ export async function runTraderCycle(): Promise<void> {
       return;
     }
 
+    signal.throwIfAborted();
+
     // Step 2: Update all open positions
     const openPositions = await prisma.position.findMany({
       where: { status: 'OPEN' },
     });
 
     for (const position of openPositions) {
+      signal.throwIfAborted();
       const { shouldClose, reason } = await enforceStopLoss(position.id);
       if (shouldClose && reason) {
         await closePosition(position.id, position.currentPrice ?? position.entryPrice, 'STOP_LOSS');
@@ -48,9 +64,12 @@ export async function runTraderCycle(): Promise<void> {
       }
     }
 
+    signal.throwIfAborted();
+
     // Step 3: Hedge opportunities
     const hedgeRecs = await detectHedgeOpportunities();
     for (const rec of hedgeRecs) {
+      signal.throwIfAborted();
       try {
         await autoHedge(rec);
       } catch (err) {
@@ -58,8 +77,10 @@ export async function runTraderCycle(): Promise<void> {
       }
     }
 
+    signal.throwIfAborted();
+
     // Step 4: Scan markets for opportunities
-    const signals = await aggregateSignals();
+    const signals = await aggregateSignals(signal);
     const activeMarkets = await prisma.market.findMany({
       where: {
         status:         'ACTIVE',
@@ -72,19 +93,20 @@ export async function runTraderCycle(): Promise<void> {
     });
 
     for (const market of activeMarkets) {
-      await analyzeAndTradeMarket(market, signals);
+      signal.throwIfAborted();
+      await analyzeAndTradeMarket(market, signals, signal);
     }
 
     logger.info('Trader Agent: cycle complete');
   } catch (err) {
     logger.error({ err }, 'Trader Agent: unhandled cycle error');
-    await prisma.agentLog.create({
-      data: { agentType: 'TRADER', level: 'ERROR', action: 'CYCLE_FAILED', error: String(err) },
-    });
+    await writeAgentLog({ agentType: 'TRADER', level: 'ERROR', action: 'CYCLE_FAILED', error: String(err) });
+  } finally {
+    handle.cleanup?.();
   }
 }
 
-async function analyzeAndTradeMarket(market: any, signals: any): Promise<void> {
+async function analyzeAndTradeMarket(market: any, signals: any, signal?: AbortSignal): Promise<void> {
   try {
     // Skip if we already have an open position in this market
     const existingPosition = await prisma.position.findFirst({
@@ -135,6 +157,8 @@ async function analyzeAndTradeMarket(market: any, signals: any): Promise<void> {
     const direction = edge > 0 ? 'YES' : 'NO';
     const price     = direction === 'YES' ? marketProb : 1 - marketProb;
 
+    signal?.throwIfAborted();
+
     // Generate reasoning trace BEFORE executing
     const { trace, tracePayload } = await generateReasoningTrace({
       marketId:            market.id,
@@ -149,7 +173,7 @@ async function analyzeAndTradeMarket(market: any, signals: any): Promise<void> {
       betSizeUsdc:         finalSize,
     });
 
-    // Execute trade
+    // Execute trade (Never abort between chain write and DB update)
     await executeTrade({
       marketId:      market.id,
       direction,

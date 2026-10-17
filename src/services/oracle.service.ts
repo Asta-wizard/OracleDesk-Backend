@@ -17,7 +17,7 @@ export function marketStatusView(status: MarketStatus): MarketStatusView {
   return { tag: status.tag };
 }
 
-export async function getResolutionStatus(marketId: string) {
+export async function getResolutionStatus(marketId: string, signal?: AbortSignal) {
   const market = await prisma.market.findUnique({
     where: { id: marketId },
     select: { id: true, status: true, onChainMarketId: true, resolutionHash: true, resolutionSpec: true },
@@ -28,8 +28,8 @@ export async function getResolutionStatus(marketId: string) {
   }
 
   const [state, onChain] = await Promise.all([
-    resolverState(market.onChainMarketId),
-    getOnChainMarket(market.onChainMarketId),
+    resolverState(market.onChainMarketId, signal),
+    getOnChainMarket(market.onChainMarketId, signal),
   ]);
 
   return {

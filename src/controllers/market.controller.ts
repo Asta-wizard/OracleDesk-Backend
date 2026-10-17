@@ -1,5 +1,7 @@
 import type { Request, Response } from 'express';
 import { prisma } from '../lib/prisma';
+import { writeAgentLog } from '../lib/agent-log';
+import { bindDetached } from '../lib/context';
 import { v4 as uuidv4 } from 'uuid';
 import type { JobRecord } from '../types';
 import { JobStatus } from '../types';
@@ -219,25 +221,23 @@ export async function triggerMarketGeneration(
 
   // ── Persist audit log ────────────────────────────────────────
 
-  prisma.agentLog
-    .create({
-      data: {
+  bindDetached(
+    () =>
+      writeAgentLog({
         agentType: 'MARKET_MAKER',
         level: 'INFO',
         action: 'GENERATION_JOB_STARTED',
-
-        data: {
-          jobId,
-        },
-      },
-    })
+        data: { jobId },
+      }),
+    { jobId },
+  )
     .catch(() => {
       // Non-blocking
     });
 
   // ── Run generation in background ─────────────────────────────
 
-  runMarketMakerCycle()
+  bindDetached(() => runMarketMakerCycle(), { jobId, kind: 'job' })
     .then((result: any) => {
       const existingJob = jobTracker.get(jobId);
 
@@ -407,7 +407,7 @@ export async function getOnChainMarketState(req: Request, res: Response): Promis
     sendError(res, 400, 'INVALID_MARKET_ID', 'onChainMarketId must be a decimal u64');
     return;
   }
-  const market = await getOnChainMarket(onChainMarketId);
+  const market = await getOnChainMarket(onChainMarketId, req.signal);
   sendSuccess(res, {
     onChainMarketId: raw,
     ...(printable({ ...market, status: undefined, category: market.category.tag }) as object),
