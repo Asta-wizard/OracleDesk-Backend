@@ -316,6 +316,7 @@ model ReasoningTrace {
   subscriptions Subscription[]
   paymentEvents PaymentEvent[]
   audits        TraceAudit[]
+  publication   TracePublication?
 
   @@index([marketId])
   @@index([ipfsCid])
@@ -547,4 +548,40 @@ model ConstraintQuarantine {
 
   @@index([tableName, checkName])
   @@map("constraint_quarantine")
+}
+
+/// Lifecycle of a reasoning trace's on-chain publication (#131).
+enum TracePublicationStatus {
+  AWAITING_PIN
+  AWAITING_MARKET
+  READY
+  SUBMITTED
+  CONFIRMED
+  FAILED
+}
+
+/// Durable queue row: one per trace that should be published to
+/// reasoning-registry. Processed by src/jobs/trace-publication.worker.ts.
+model TracePublication {
+  id               String                 @id @default(uuid())
+  traceId          String                 @unique
+  action           String
+  /// Exact trace document; pinned bytes = canonicalBytes(payload). Null only
+  /// for backfilled rows whose trace was already pinned.
+  payload          Json?
+  status           TracePublicationStatus @default(AWAITING_PIN)
+  attempts         Int                    @default(0)
+  lastError        String?
+  nextAttemptAt    DateTime               @default(now())
+  submittedTxHash  String?
+  /// Trace id returned by the publish_trace write, used to re-check chain state.
+  submittedTraceId BigInt?
+  confirmedAt      DateTime?
+  createdAt        DateTime               @default(now())
+  updatedAt        DateTime               @updatedAt
+
+  trace ReasoningTrace @relation(fields: [traceId], references: [id], onDelete: Cascade)
+
+  @@index([status, nextAttemptAt])
+  @@map("trace_publications")
 }
