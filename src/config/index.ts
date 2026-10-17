@@ -25,6 +25,12 @@ const optionalAddress = z
     'must be a G… account or C… contract address',
   );
 
+export const PROBE_NAMES = ['database', 'redis', 'rpc', 'indexer'] as const;
+
+const probeName = z
+  .string()
+  .refine((v) => (PROBE_NAMES as readonly string[]).includes(v), `must be one of ${PROBE_NAMES.join(', ')}`);
+
 const commaList = (item: z.ZodType<string, string>, fallback = "") =>
   z
     .string()
@@ -100,6 +106,18 @@ const envSchema = z
 
     INDEXER_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
     INDEXER_POLL_MS: z.string().default('5000').transform(Number),
+
+    // ── Health probes (#111) ──────────────────────────────────────────────
+    // Dependencies that make /readyz fail. RPC is non-critical by default so
+    // cached DB reads can still be served while chain reads return 502.
+    HEALTH_CRITICAL: commaList(probeName, 'database,redis'),
+    HEALTH_PROBE_TIMEOUT_MS: z.string().default('1500').transform(Number),
+    HEALTH_CACHE_TTL_MS: z.string().default('2000').transform(Number),
+    INDEXER_MAX_LAG_LEDGERS: z.string().default('120').transform(Number),
+    INDEXER_MAX_STALENESS_MS: z.string().default('60000').transform(Number),
+    LIVENESS_MAX_LOOP_DELAY_MS: z.string().default('2000').transform(Number),
+    // Time /readyz reports "draining" before the HTTP server stops accepting.
+    SHUTDOWN_DRAIN_MS: z.string().default('5000').transform(Number),
 
     // ── LLM providers (optional; generation fails at runtime without one) ─
     ANTHROPIC_API_KEY: optionalString,

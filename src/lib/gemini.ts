@@ -56,6 +56,13 @@ function isQuotaExhausted(): boolean {
   return Date.now() < _quotaExhaustedUntil;
 }
 
+/** Read-only breaker state for the admin status endpoint. */
+export function geminiBreakerState(): { open: boolean; until: string | null } {
+  return isQuotaExhausted()
+    ? { open: true, until: new Date(_quotaExhaustedUntil).toISOString() }
+    : { open: false, until: null };
+}
+
 function markQuotaExhausted(): void {
   _quotaExhaustedUntil = Date.now() + QUOTA_COOLDOWN_MS;
   logger.error(

@@ -11,6 +11,7 @@ import { startTraceAuditCron } from './cron/trace-audit.cron';
 import { startTracePublicationCron } from './cron/trace-publication.cron';
 import { startEventListener } from './services/indexer.service';
 import { closeRedis } from './lib/redis';
+import { health } from './services/health.service';
 
 let stopEventListener: (() => void) | null = null;
 let stopSecretRefresh: (() => void) | null = null;
@@ -81,6 +82,14 @@ async function bootstrap(): Promise<void> {
   // ─── Graceful Shutdown ───
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutting down gracefully...');
+    // Force exit if shutdown (drain + close) takes too long
+    setTimeout(() => {
+      logger.error('Forced shutdown after timeout');
+      process.exit(1);
+    }, 15_000);
+    // Report 503 from /readyz first so load balancers stop routing before the socket closes.
+    health.startDraining();
+    await new Promise((resolve) => setTimeout(resolve, config.SHUTDOWN_DRAIN_MS));
     const { triggerShutdown } = await import('./lib/shutdown');
     triggerShutdown();
 
@@ -93,12 +102,6 @@ async function bootstrap(): Promise<void> {
       logger.info('Database disconnected');
       process.exit(0);
     });
-
-    // Force exit if shutdown takes too long
-    setTimeout(() => {
-      logger.error('Forced shutdown after timeout');
-      process.exit(1);
-    }, 15_000);
   };
 
   process.on('SIGTERM', () => shutdown('SIGTERM'));
@@ -110,6 +113,7 @@ async function bootstrap(): Promise<void> {
   });
 
   process.on('uncaughtException', (err) => {
+    health.markFatal();
     logger.fatal({ err }, 'Uncaught exception — shutting down');
     process.exit(1);
   });
