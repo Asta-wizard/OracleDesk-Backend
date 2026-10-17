@@ -67,6 +67,23 @@ Key switches:
 - `CHAIN_EXECUTION_MODE=dry-run` (default): every contract write is built and simulated, logged, and never signed. `live` signs with `AGENT_SECRET_KEY` and is refused on any network but testnet.
 - `PAYMENTS_RECIPIENT`: where daily-pass payments must go. Defaults to the treasury contract; see [docs/STATUS.md](docs/STATUS.md) before relying on that.
 - `ADMIN_ADDRESSES`: G-addresses allowed to trigger market generation.
+- `SECRETS_PROVIDER`: `env` (default), `file` (`<NAME>_FILE` mounts) or
+  `vault`. See [docs/architecture.md](docs/architecture.md#secrets-145).
+- `IPFS_TRANSPORT=local` stores pinned bytes in `.ipfs-local/` for offline
+  development; production refuses it.
+
+### Offline seeded environment (#147)
+
+```bash
+IPFS_TRANSPORT=local npm run db:seed        # deterministic; writes .ipfs-local/
+IPFS_TRANSPORT=local npm run dev
+```
+
+Every seeded question and trace hash commits to bytes stored under
+`.ipfs-local/<cid>`, so `POST /traces/verify` and the trace-hash checks pass
+without Pinata or network access. `npm run db:seed -- --reset` truncates first;
+`--now` shifts timestamps; `--from-snapshot <dir>` loads an anonymised NDJSON
+snapshot; `--with-raw-events <file>` writes a `getEvents` fixture.
 
 ## API at a glance
 
@@ -74,7 +91,7 @@ The full contract with the frontend, including request and response shapes, erro
 
 | Area | Endpoints |
 |---|---|
-| Health | `GET /health` |
+| Health | `GET /health`, `GET /readyz` |
 | Auth | `POST /auth/challenge`, `POST /auth/verify` (signed challenge transaction → JWT) |
 | Markets | `GET /markets`, `GET /markets/:id`, `GET /markets/on-chain/:onChainMarketId`, `GET /markets/on-chain/:onChainMarketId/state` (live from the chain), `POST /markets/generate` (admin), `GET /markets/generation-status/:jobId` |
 | Traces | `GET /traces`, `GET /traces/:id`, `POST /traces/verify`, `POST /traces/:id/unlock` (daily pass, verified on-chain), `GET`/`PUT /traces/access/allowance`, `GET /traces/payments` |
@@ -93,8 +110,15 @@ The full contract with the frontend, including request and response shapes, erro
 | `npm run sync:contracts` | Copy generated contract code from `contracts/` into `src/generated/` |
 | `npm run check:contracts` | Fail if `src/generated/` is stale (CI runs this) |
 | `npm run prisma:migrate` | `prisma migrate dev` |
+| `npm run db:seed` | Deterministic local dataset (#147); `--reset`, `--now`, `--from-snapshot`, `--link-testnet` |
+| `npm run snapshot:export -- --out <dir>` | Anonymised NDJSON snapshot (`SNAPSHOT_SALT` required) |
+| `npm run reconcile:post-restore -- --manifest … --out …` | Replay the chain gap after a restore (#146) |
+| `scripts/backup.sh` / `scripts/restore.sh` | Dump with manifest + checksum / restore (#146) |
+| `scripts/check-migration-compat.mjs` | Expand/contract migration lint (#144) |
+| `scripts/post-deploy-checks.sh` | Readiness, digest, indexer lag and burn-rate checks |
 | `scripts/smoke.sh` | Smoke test a running server (health, login, markets, live chain read) |
 | `docker compose up -d` / `down` | Start / stop local Postgres and Redis |
+| `docker compose --profile backup up -d backup` | Optional backup loop |
 
 ## Project structure
 
@@ -107,10 +131,11 @@ src/
                  IPFS, trace publishing, market creation, LLM-backed logic
   services/stellar/  Binding clients and contract error names
   lib/           Prisma, Redis, logger, categories, amounts, resolution specs
+  seed/          Deterministic dataset + raw-event encoder (#147)
   generated/     Copied from the contracts submodule. Do not edit.
-prisma/          Schema and forward-only migrations
+prisma/          Schema, forward-only migrations, seed runner
 tests/           node:test suites and fixtures
-scripts/         sync-contracts.mjs, smoke.sh
+scripts/         Contract sync, seed/snapshot/reconcile, backup/restore, deploy checks
 docker-compose.yml  Local Postgres and Redis
 contracts/       OracleDesk-SmartContract submodule (pinned)
 docs/            API contract, architecture, porting notes, status, backlog

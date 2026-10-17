@@ -1,14 +1,26 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import { config } from '../config';
+import { secret, secretEntry } from '../config/secrets';
 import { logger } from './logger';
 import { deadline, sleep, TimeoutError } from './resilience';
 
-// ─── Singleton client ─────────────────────────────────────────────────────────
-let genAI = new GoogleGenerativeAI(config.GEMINI_API_KEY);
+// ─── Lazy client, rebuilt after key rotation (#145) ──────────────────────────
+let cachedClient: GoogleGenerativeAI | null = null;
+let cachedVersion = -1;
 
+export function getGenAI(): GoogleGenerativeAI {
+  const entry = secretEntry('GEMINI_API_KEY');
+  if (!cachedClient || entry.version !== cachedVersion) {
+    cachedClient = new GoogleGenerativeAI(entry.current);
+    cachedVersion = entry.version;
+  }
+  return cachedClient;
+}
+
+/** Test seam: installs a mock and keeps it until the real key rotates. */
 export function setGenAI(mock: any): any {
-  const prev = genAI;
-  genAI = mock;
+  const prev = cachedClient;
+  cachedClient = mock;
+  cachedVersion = secretEntry('GEMINI_API_KEY').version;
   return prev;
 }
 
@@ -98,7 +110,7 @@ export async function callGemini(
   try {
     await waitForCallSlot(handle.signal);
 
-    const model = genAI.getGenerativeModel({
+    const model = getGenAI().getGenerativeModel({
       model: GEMINI_MODEL,
       systemInstruction: systemPrompt,
       generationConfig: {
@@ -147,7 +159,7 @@ export async function callGeminiJSON(
 
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        const model = genAI.getGenerativeModel({
+        const model = getGenAI().getGenerativeModel({
           model: GEMINI_MODEL,
           systemInstruction: systemPrompt,
           generationConfig: {
@@ -221,4 +233,4 @@ export async function callGeminiJSON(
   }
 }
 
-export default genAI;
+export default getGenAI;

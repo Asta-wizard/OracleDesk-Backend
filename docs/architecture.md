@@ -97,3 +97,44 @@ Copy trades are verified against on-chain transaction metadata:
 - When a user submits an on-chain transaction hash (`POST /trade/copy/:id/confirm`), `copy-trade.service.ts` inspects the transaction status, envelope, and contract events (`CONTRACTS.marketCore` `Trade` event in `resultMetaXdr`) to verify market ID, trader wallet, outcome, direction (`is_buy`), and collateral amount.
 - Pending transactions return `202 CONFIRMING` and are swept by the indexer projection and a background cron job.
 
+
+## Secrets (#145)
+
+`src/config/secrets.ts` is the only runtime source of secret values.
+
+- `SECRETS_PROVIDER=env` (default) reads the environment; `file` reads
+  `<NAME>_FILE` mounts and re-reads them on refresh; `vault` reads a Vault KV v2
+  path using a token file. AWS Secrets Manager can be added through the same
+  `SecretsProvider` interface.
+- Boot resolves files in `loadConfig`, then `initSecrets` validates and stores
+  raw values as Buffers. Empty or invalid refresh values keep the previous
+  value; a provider failure keeps everything.
+- JWT rotation keeps the previous key for
+  `JWT_PREVIOUS_SECRET_GRACE_SECS` (default 24h), then zeroes it. Expired tokens
+  are never retried against the previous key.
+- SDK clients (Gemini, Anthropic) rebuild when the key version changes.
+  Values already copied into an SDK are immutable strings; zeroing the store
+  only guarantees the long-lived copy is gone.
+- `AGENT_SECRET_KEY` is deliberately not in the runtime secret store: rotating
+  the agent identity is an on-chain registration change, so it stays env-only
+  and requires a restart. `DATABASE_URL` must be available at boot (env or
+  `DATABASE_URL_FILE`); rotating it through Vault would not rebuild Prisma.
+
+## Seed and snapshots (#147)
+
+`npm run db:seed` builds a deterministic dataset through `src/seed/scenario.ts`.
+Every question/trace hash is computed with the production helpers and the exact
+bytes are written under `.ipfs-local/` (CIDv1 raw/sha2-256). It refuses
+production, live-chain mode and non-local databases unless
+`SEED_ALLOW_REMOTE=1`.
+
+`npm run snapshot:export -- --out <dir>` streams anonymised NDJSON. The column
+map is fail-closed: a new column without an anonymisation rule stops the export.
+Hashed identifiers use `SNAPSHOT_SALT`; Stellar addresses are mapped to
+deterministic throwaway G-addresses.
+
+## Backups (#146)
+
+Custom-format dumps plus a manifest (migrations, cursor, max ledger, counts)
+and checksums. Restore then replays the chain gap with
+`scripts/post-restore-reconcile.ts`; see the runbook.

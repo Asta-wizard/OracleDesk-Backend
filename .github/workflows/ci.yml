@@ -4,6 +4,7 @@ on:
   push:
     branches: [main, develop]
   pull_request:
+  workflow_call:
 
 jobs:
   backend:
@@ -59,3 +60,29 @@ jobs:
         run: npx tsx scripts/audit-constraints.ts --json audit.json
       - run: npm run build
       - run: npm test
+
+      - name: Migration compatibility (new migrations only)
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch origin "${{ github.base_ref }}" --depth=1
+          changed="$(git diff --name-only "origin/${{ github.base_ref }}...HEAD" -- prisma/migrations || true)"
+          if [[ -n "$changed" ]]; then
+            printf '%s\n' "$changed" | xargs node scripts/check-migration-compat.mjs
+          else
+            echo "No migration files changed"
+          fi
+
+  lint-workflows:
+    name: Workflow and script lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: actionlint
+        uses: docker://rhysd/actionlint:latest
+        with:
+          args: -color
+      - name: shellcheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: ./scripts
+          additional_files: ./scripts/backup.sh ./scripts/restore.sh

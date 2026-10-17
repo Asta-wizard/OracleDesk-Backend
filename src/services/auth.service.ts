@@ -8,6 +8,7 @@
  */
 import { Keypair, StrKey, TransactionBuilder, WebAuth } from '@stellar/stellar-sdk';
 import { config } from '../config';
+import { secret } from '../config/secrets';
 import { prisma } from '../lib/prisma';
 import { getRedis } from '../lib/redis';
 import { AppError } from '../middlewares/error.middleware';
@@ -50,7 +51,7 @@ export function setChallengeStore(next: ChallengeStore): ChallengeStore {
   return prev;
 }
 
-const serverKeypair = () => Keypair.fromSecret(config.AUTH_SIGNING_SECRET);
+const serverKeypair = () => Keypair.fromSecret(secret('AUTH_SIGNING_SECRET'));
 
 export function assertStellarAccount(address: unknown): asserts address is string {
   if (typeof address !== 'string' || !StrKey.isValidEd25519PublicKey(address)) {

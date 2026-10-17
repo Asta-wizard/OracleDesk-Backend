@@ -19,7 +19,7 @@
  */
 
 import Anthropic from '@anthropic-ai/sdk';
-import { config } from '../config';
+import { secretEntry } from '../config/secrets';
 import { logger } from './logger';
 import { callGemini, callGeminiJSON } from './gemini';
 import { bulkheads, deadline, sleep } from './resilience';
@@ -28,11 +28,14 @@ const CLAUDE_MODEL = 'claude-sonnet-4-6';
 
 // ─── Lazy Anthropic client ────────────────────────────────────────────────────
 let _anthropic: Anthropic | null = null;
+let _anthropicVersion = -1;
 
-function getAnthropicClient(): Anthropic | null {
-  if (!config.ANTHROPIC_API_KEY) return null;
-  if (!_anthropic) {
-    _anthropic = new Anthropic({ apiKey: config.ANTHROPIC_API_KEY });
+export function getAnthropicClient(): Anthropic | null {
+  const entry = secretEntry('ANTHROPIC_API_KEY');
+  if (!entry.current) return null;
+  if (!_anthropic || entry.version !== _anthropicVersion) {
+    _anthropic = new Anthropic({ apiKey: entry.current });
+    _anthropicVersion = entry.version;
   }
   return _anthropic;
 }

@@ -161,7 +161,10 @@ async function applySideEffects(event: DecodedEvent, emit: IndexerDeps['emit']):
   }
 
   if (event.contractName === 'reasoningRegistry' && event.eventName === 'TracePublished') {
-    const traceHash = Buffer.from(p.trace_hash).toString('hex');
+    const traceHash =
+      typeof p.trace_hash === 'string'
+        ? p.trace_hash
+        : Buffer.from(p.trace_hash).toString('hex');
     const onChainTraceId = BigInt(p.trace_id);
     const onChainMarketId = BigInt(p.market_id);
     const trace = await prisma.reasoningTrace.findFirst({
@@ -270,6 +273,41 @@ export async function backfillEvents(
   } finally {
     handle.cleanup?.();
   }
+}
+
+/**
+ * Re-applies one stored event's projections (#146). Unlike the normal path it
+ * does not insert the event first, so a restore can rebuild projections for
+ * rows that survived the backup. Callers replay in (ledger, id) order.
+ */
+export async function reprojectEvent(
+  event: DecodedEvent,
+  emit: IndexerDeps['emit'] = () => undefined,
+): Promise<void> {
+  await applySideEffects(event, emit);
+}
+
+/** Converts a stored row back into the decoded shape used by applySideEffects. */
+export function decodedFromStored(row: {
+  id: string;
+  contractId: string;
+  contractName: string;
+  eventName: string;
+  ledger: number;
+  ledgerClosedAt: Date;
+  txHash: string;
+  params: unknown;
+}): DecodedEvent {
+  return {
+    id: row.id,
+    contractId: row.contractId,
+    contractName: row.contractName as ContractName,
+    eventName: row.eventName,
+    ledger: row.ledger,
+    ledgerClosedAt: row.ledgerClosedAt.toISOString(),
+    txHash: row.txHash,
+    params: row.params as Record<string, any>,
+  };
 }
 
 /** Polls every INDEXER_POLL_MS. Returns a stop function. */
