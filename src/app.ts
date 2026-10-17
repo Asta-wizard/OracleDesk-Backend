@@ -9,6 +9,7 @@ import { config } from './config';
 import { logger } from './lib/logger';
 import { errorMiddleware } from './middlewares/error.middleware';
 import { globalLimiter } from './middlewares/rate-limit.middleware';
+import { abortMiddleware } from './middlewares/abort.middleware';
 import router from './routes';
 
 const app = express();
@@ -48,6 +49,9 @@ app.use(
     skip:   () => config.NODE_ENV === 'test',
   }),
 );
+
+// ─── Request Timeout & Abort Signal ───
+app.use(abortMiddleware);
 
 // ─── Health Check ───
 app.get('/health', (_req, res) => {

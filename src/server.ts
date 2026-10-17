@@ -6,6 +6,7 @@ import { logger } from './lib/logger';
 import { prisma } from './lib/prisma';
 import { startIngestionCron } from './cron/ingestion.cron';
 import { startMonitorCron } from './cron/monitor.cron';
+import { startTraceAuditCron } from './cron/trace-audit.cron';
 import { startEventListener } from './services/indexer.service';
 import { closeRedis } from './lib/redis';
 
@@ -44,6 +45,7 @@ async function bootstrap(): Promise<void> {
   // 4. Start cron jobs
   startIngestionCron();
   startMonitorCron();
+  startTraceAuditCron();
 
   io.on('connection', (socket) => {
     logger.info({ socketId: socket.id }, 'New client connected to socket.io');
@@ -66,6 +68,8 @@ async function bootstrap(): Promise<void> {
   // ─── Graceful Shutdown ───
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutting down gracefully...');
+    const { triggerShutdown } = await import('./lib/shutdown');
+    triggerShutdown();
 
     server.close(async () => {
       if (stopEventListener) stopEventListener();

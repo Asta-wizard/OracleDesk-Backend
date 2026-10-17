@@ -5,6 +5,7 @@ import traceRoutes     from './trace.routes';
 import portfolioRoutes from './portfolio.routes';
 import tradeRoutes     from './trade.routes';
 import oracleRoutes    from './oracle.routes';
+import adminRoutes     from './admin.routes';
 
 const router = Router();
 
@@ -14,5 +15,6 @@ router.use('/traces',    traceRoutes);
 router.use('/portfolio', portfolioRoutes);
 router.use('/trade',     tradeRoutes);
 router.use('/oracle',    oracleRoutes);
+router.use('/admin',     adminRoutes);
 
 export default router;

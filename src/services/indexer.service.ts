@@ -21,6 +21,7 @@ import { logger } from '../lib/logger';
 import { readClients, rpcServer } from './stellar/clients';
 import { printable } from './chain.service';
 import { priceYesBps } from '../generated/fpmm';
+import { withTimeout, deadline } from '../lib/resilience';
 
 export type EventSource = Pick<rpc.Server, 'getEvents' | 'getHealth'>;
 
@@ -110,6 +111,15 @@ async function applySideEffects(event: DecodedEvent, emit: IndexerDeps['emit']):
     if (market) {
       await prisma.market.update({ where: { id: market.id }, data: { currentYesProb: yesBps / 10_000 } });
     }
+    if (Boolean(p.is_buy)) {
+      try {
+        const { reconcileFromTradeEvent } = await import('./copy-trade.service');
+        await reconcileFromTradeEvent(event);
+      } catch (err) {
+        logger.error({ err, eventId: event.id }, 'Indexer: copy trade reconciliation failed');
+      }
+    }
+
     emit('TRADE_EXECUTED', {
       onChainMarketId: onChainMarketId.toString(),
       marketId: market?.id ?? null,
@@ -153,7 +163,14 @@ async function applySideEffects(event: DecodedEvent, emit: IndexerDeps['emit']):
   if (event.contractName === 'reasoningRegistry' && event.eventName === 'TracePublished') {
     const traceHash = Buffer.from(p.trace_hash).toString('hex');
     const onChainTraceId = BigInt(p.trace_id);
-    const trace = await prisma.reasoningTrace.findFirst({ where: { traceHash }, select: { id: true, onChainTraceId: true } });
+    const onChainMarketId = BigInt(p.market_id);
+    const trace = await prisma.reasoningTrace.findFirst({
+      where: {
+        traceHash,
+        market: { onChainMarketId },
+      },
+      select: { id: true, onChainTraceId: true },
+    });
     if (trace && trace.onChainTraceId === null) {
       await prisma.reasoningTrace.update({
         where: { id: trace.id },
@@ -194,49 +211,65 @@ async function writeCursor(lastLedger: number): Promise<void> {
 export async function backfillEvents(
   fromLedger?: number,
   deps: IndexerDeps = { source: rpcServer, emit: () => undefined },
+  opts?: { signal?: AbortSignal },
 ): Promise<{ startLedger: number; lastLedger: number; seen: number; stored: number }> {
-  const health = await deps.source.getHealth();
-  const cursor = await readCursor();
-  let startLedger = fromLedger ?? (cursor !== null ? cursor + 1 : health.oldestLedger);
+  const tickLimitMs = Math.floor(config.CYCLE_DEADLINE_MS / 10);
+  const handle = deadline('rpc-events', opts?.signal, tickLimitMs);
 
-  if (startLedger < health.oldestLedger) {
-    logger.warn(
-      { requested: startLedger, oldestAvailable: health.oldestLedger },
-      'Indexer cursor is older than RPC retention; resuming from the oldest available ledger. Events in between are not indexed.',
-    );
-    startLedger = health.oldestLedger;
-  }
-  if (startLedger > health.latestLedger) {
-    return { startLedger, lastLedger: cursor ?? health.latestLedger, seen: 0, stored: 0 };
-  }
+  try {
+    const health = await withTimeout('rpc-events', async () => deps.source.getHealth(), { signal: handle.signal });
+    const cursor = await readCursor();
+    let startLedger = fromLedger ?? (cursor !== null ? cursor + 1 : health.oldestLedger);
 
-  const known = specs();
-  const filters: rpc.Api.EventFilter[] = [{ type: 'contract', contractIds: [...known.keys()] }];
-  let seen = 0;
-  let stored = 0;
-  let latestLedger = health.latestLedger;
-  let page = await deps.source.getEvents({ startLedger, filters, limit: PAGE_LIMIT });
-
-  for (;;) {
-    latestLedger = page.latestLedger;
-    for (const raw of page.events) {
-      seen++;
-      const decoded = decodeEvent(raw, known);
-      if (!decoded) continue;
-      if (await store(decoded)) {
-        stored++;
-        await applySideEffects(decoded, deps.emit).catch((err) =>
-          logger.error({ err, eventId: decoded.id }, 'Indexer side effect failed'),
-        );
-      }
+    if (startLedger < health.oldestLedger) {
+      logger.warn(
+        { requested: startLedger, oldestAvailable: health.oldestLedger },
+        'Indexer cursor is older than RPC retention; resuming from the oldest available ledger. Events in between are not indexed.',
+      );
+      startLedger = health.oldestLedger;
     }
-    if (page.events.length < PAGE_LIMIT) break;
-    page = await deps.source.getEvents({ filters, cursor: page.cursor, limit: PAGE_LIMIT });
-  }
+    if (startLedger > health.latestLedger) {
+      return { startLedger, lastLedger: cursor ?? health.latestLedger, seen: 0, stored: 0 };
+    }
 
-  await writeCursor(latestLedger);
-  if (stored > 0) logger.info({ startLedger, lastLedger: latestLedger, seen, stored }, 'Indexed Stellar events');
-  return { startLedger, lastLedger: latestLedger, seen, stored };
+    const known = specs();
+    const filters: rpc.Api.EventFilter[] = [{ type: 'contract', contractIds: [...known.keys()] }];
+    let seen = 0;
+    let stored = 0;
+    let latestLedger = health.latestLedger;
+    let page = await withTimeout(
+      'rpc-events',
+      async () => deps.source.getEvents({ startLedger, filters, limit: PAGE_LIMIT }),
+      { signal: handle.signal },
+    );
+
+    for (;;) {
+      latestLedger = page.latestLedger;
+      for (const raw of page.events) {
+        seen++;
+        const decoded = decodeEvent(raw, known);
+        if (!decoded) continue;
+        if (await store(decoded)) {
+          stored++;
+          await applySideEffects(decoded, deps.emit).catch((err) =>
+            logger.error({ err, eventId: decoded.id }, 'Indexer side effect failed'),
+          );
+        }
+      }
+      if (page.events.length < PAGE_LIMIT) break;
+      page = await withTimeout(
+        'rpc-events',
+        async () => deps.source.getEvents({ filters, cursor: page.cursor, limit: PAGE_LIMIT }),
+        { signal: handle.signal },
+      );
+    }
+
+    await writeCursor(latestLedger);
+    if (stored > 0) logger.info({ startLedger, lastLedger: latestLedger, seen, stored }, 'Indexed Stellar events');
+    return { startLedger, lastLedger: latestLedger, seen, stored };
+  } finally {
+    handle.cleanup?.();
+  }
 }
 
 /** Polls every INDEXER_POLL_MS. Returns a stop function. */

@@ -44,7 +44,7 @@ export async function pinAndPublishTrace(params: {
 
   await prisma.reasoningTrace.update({
     where: { id: params.traceId },
-    data: { onChainTraceId: result.value, publishTxHash: result.txHash, verified: true },
+    data: { onChainTraceId: result.value, publishTxHash: result.txHash },
   });
   return { cid: pinned.cid, traceHash: pinned.hash, onChainTraceId: result.value, publishTxHash: result.txHash };
 }
@@ -68,7 +68,14 @@ export async function verifyTraceOnChain(traceId: string): Promise<TraceVerifica
   const bytes = await fetchIpfsBytes(onChain.ipfs_cid);
   const verified = verifyTraceHash(bytes, onChainHash);
 
-  await prisma.reasoningTrace.update({ where: { id: traceId }, data: { verified } });
+  await prisma.reasoningTrace.update({
+    where: { id: traceId },
+    data: {
+      verified,
+      lastAuditStatus: verified ? 'VERIFIED' : 'HASH_MISMATCH',
+      lastAuditedAt: new Date(),
+    },
+  });
 
   return {
     traceId,

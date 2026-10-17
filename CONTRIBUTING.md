@@ -31,6 +31,8 @@ Forgot `--recurse-submodules`? Run `git submodule update --init`.
 ```bash
 npm run check:contracts     # generated contract code matches the submodule
 npx prisma migrate deploy   # against a scratch database
+npx prisma migrate diff --from-migrations prisma/migrations --to-schema-datamodel prisma/schema.prisma --exit-code
+npx tsx scripts/audit-constraints.ts --json audit.json
 npm run build
 npm test
 ```
@@ -44,6 +46,12 @@ Edit `prisma/schema.prisma`, then `npx prisma migrate dev --name <what>`.
 Migrations are forward-only: never edit one that has been merged. If a
 migration changes data (not just shape), say so in the PR and in a comment
 at the top of the SQL.
+
+When adding `CHECK` constraints or foreign keys to existing tables, follow the
+`NOT VALID` -> audit -> `VALIDATE` pattern to avoid long-running exclusive locks:
+1. Add the constraint or foreign key with `NOT VALID` (only acquires a fast lock).
+2. Run `scripts/audit-constraints.ts [--fix]` to detect and repair or quarantine any invalid rows.
+3. Validate the constraint in a subsequent migration using `ALTER TABLE ... VALIDATE CONSTRAINT ...` (takes `SHARE UPDATE EXCLUSIVE`, keeping tables available for reads and writes).
 
 ## Chain writes
 

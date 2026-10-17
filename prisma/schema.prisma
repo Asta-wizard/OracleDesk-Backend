@@ -52,6 +52,15 @@ enum TradeStatus {
   CANCELLED
 }
 
+enum CopyTradeStatus {
+  PENDING
+  CONFIRMING
+  EXECUTED
+  FAILED
+  CANCELLED
+  EXPIRED
+}
+
 enum PositionStatus {
   OPEN
   CLOSED
@@ -72,6 +81,37 @@ enum SubscriptionStatus {
   FAILED
   REVOKED
   LIMIT_REACHED
+}
+
+enum PaymentEventType {
+  DAILY_PASS
+  PER_TRACE
+  REFUND
+}
+
+enum PaymentEventStatus {
+  PENDING
+  CONFIRMED
+  FAILED
+  REFUNDED
+}
+
+enum GenerationJobStatus {
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum TraceAuditStatus {
+  VERIFIED
+  HASH_MISMATCH
+  UNAVAILABLE
+  UNKNOWN_TO_BACKEND
+  WRONG_MARKET
+  UNLINKED_IN_DB
+  NOT_ON_CHAIN
+  FOREIGN_AGENT
+  ARCHIVED
 }
 
 enum AgentType {
@@ -112,23 +152,33 @@ model Market {
   category           MarketCategory
   status             MarketStatus       @default(PENDING)
   settlementCurrency SettlementCurrency @default(USDC)
+  /// CHECK: markets_initial_yes_prob_range (initialYesProb >= 0 AND initialYesProb <= 1)
   initialYesProb     Float
+  /// CHECK: markets_current_yes_prob_range (currentYesProb IS NULL OR (currentYesProb >= 0 AND currentYesProb <= 1))
   currentYesProb     Float?
+  /// CHECK: markets_ci_shape (confidenceInterval is object with lower <= upper)
   confidenceInterval Json               // { lower: Float, upper: Float }
   expiryTimestamp    DateTime
   resolutionOracle   String?
   resolvedOutcome    Boolean?
   resolvedAt         DateTime?
+  /// CHECK: markets_min_liquidity_nonneg (minimumLiquidity >= 0)
   minimumLiquidity   Float              @default(100)
+  /// CHECK: markets_total_liquidity_nonneg (totalLiquidity >= 0)
   totalLiquidity     Float              @default(0)
+  /// CHECK: markets_onchain_id_nonneg (onChainMarketId IS NULL OR onChainMarketId >= 0)
   /// market-core u64 market id. Serialised as a decimal string in JSON.
   onChainMarketId    BigInt?            @unique
+  /// CHECK: markets_creation_tx_hash_format (creationTxHash IS NULL OR 64 hex chars)
   creationTxHash     String?
+  /// CHECK: markets_seed_amount_raw_digits (seedAmountRaw IS NULL OR digits only)
   /// Seed liquidity in 7-decimal USDC base units.
   seedAmountRaw      String?
+  /// CHECK: markets_question_hash_format (questionHash IS NULL OR 64 hex chars)
   /// sha256 (hex) of the canonical question JSON pinned at metaUri.
   questionHash       String?
   metaUri            String?
+  /// CHECK: markets_resolution_hash_format (resolutionHash IS NULL OR 64 hex chars)
   /// sha256(XDR(ResolutionSpec)) committed on-chain at creation (ADR 0001).
   resolutionHash     String?
   /// Revealed preimage of resolutionHash, kept so it can be registered with the resolver.
@@ -140,6 +190,7 @@ model Market {
 
   trades         Trade[]
   positions      Position[]
+  hedgePositions Position[]          @relation("MarketHedgePositions")
   reasoningTraces ReasoningTrace[]
   copyTrades     CopyTrade[]
   agentLogs      AgentLog[]
@@ -154,12 +205,12 @@ model Market {
 
 // Background job for market generation process, tracking status and errors
 model MarketGenerationJob {
-  id          String   @id @default(cuid())
-  status      String   @default("PROCESSING")
-  marketId    String?  @unique
+  id          String              @id @default(cuid())
+  status      GenerationJobStatus @default(PROCESSING)
+  marketId    String?             @unique
   traceId     String?
   error       String?
-  startedAt   DateTime @default(now())
+  startedAt   DateTime            @default(now())
   completedAt DateTime?
 
   market Market? @relation("MarketGenerationJobMarket", fields: [marketId], references: [id])
@@ -174,6 +225,7 @@ model Trade {
   marketId     String
   direction    TradeDirection
   status       TradeStatus    @default(PENDING)
+  /// CHECK: trades_amount_nonneg (amount >= 0)
   amount       Float
   price        Float
   edgeDetected Float
@@ -202,7 +254,9 @@ model Position {
   tradeId      String         @unique
   direction    TradeDirection
   status       PositionStatus @default(OPEN)
+  /// CHECK: positions_entry_price_range (entryPrice >= 0 AND entryPrice <= 1)
   entryPrice   Float
+  /// CHECK: positions_current_price_range (currentPrice IS NULL OR (currentPrice >= 0 AND currentPrice <= 1))
   currentPrice Float?
   size         Float
   pnl          Float          @default(0)
@@ -212,8 +266,9 @@ model Position {
   createdAt    DateTime       @default(now())
   updatedAt    DateTime       @updatedAt
 
-  market Market  @relation(fields: [marketId], references: [id], onDelete: Cascade)
-  trade  Trade   @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  market      Market  @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  hedgeMarket Market? @relation("MarketHedgePositions", fields: [hedgeMarketId], references: [id], onDelete: SetNull)
+  trade       Trade   @relation(fields: [tradeId], references: [id], onDelete: Cascade)
 
   @@index([marketId])
   @@index([status])
@@ -222,68 +277,92 @@ model Position {
 
 /// Structured AI reasoning trace for every decision
 model ReasoningTrace {
-  id                  String    @id @default(uuid())
+  id                  String            @id @default(uuid())
   marketId            String
   agentType           AgentType
   decisionType        String
-  sourcesUsed         Json      // Array<{ source, weight, signal }>
+  sourcesUsed         Json              // Array<{ source, weight, signal }>
+  /// CHECK: reasoning_traces_prob_est_range (probabilityEstimate >= 0 AND probabilityEstimate <= 1)
   probabilityEstimate Float
+  /// CHECK: reasoning_traces_market_prob_range (marketProbability >= 0 AND marketProbability <= 1)
   marketProbability   Float
   edge                Float
-  confidenceInterval  Json      // { lower: Float, upper: Float }
+  /// CHECK: reasoning_traces_ci_shape (confidenceInterval is object with lower <= upper)
+  confidenceInterval  Json              // { lower: Float, upper: Float }
   betFraction         Float?
   betSizeUsdc         Float?
-  hedgeConditions     Json?     // string[]
+  hedgeConditions     Json?             // string[]
   agentWallet         String?
   signature           String?
   ipfsCid             String?
+  /// CHECK: reasoning_traces_trace_hash_format (traceHash IS NULL OR 64 hex chars)
   /// sha256 (hex) of the exact bytes pinned to IPFS.
   traceHash           String?
+  /// CHECK: reasoning_traces_onchain_id_nonneg (onChainTraceId IS NULL OR onChainTraceId >= 0)
   /// reasoning-registry u64 trace id.
-  onChainTraceId      BigInt?   @unique
+  onChainTraceId      BigInt?           @unique
+  /// CHECK: reasoning_traces_publish_tx_hash_format (publishTxHash IS NULL OR 64 hex chars)
   publishTxHash       String?
-  verified            Boolean   @default(false)
-  isPublic            Boolean   @default(false)
-  previewSources      Json?     // First 2 sources (free preview)
-  createdAt           DateTime  @default(now())
-  updatedAt           DateTime  @updatedAt
+  verified            Boolean           @default(false)
+  isPublic            Boolean           @default(false)
+  previewSources      Json?             // First 2 sources (free preview)
+  lastAuditStatus     TraceAuditStatus?
+  lastAuditedAt       DateTime?
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
 
   market        Market         @relation(fields: [marketId], references: [id], onDelete: Cascade)
   copyTrades    CopyTrade[]
   subscriptions Subscription[]
+  paymentEvents PaymentEvent[]
+  audits        TraceAudit[]
 
   @@index([marketId])
   @@index([ipfsCid])
   @@index([verified])
+  @@index([traceHash])
   @@index([createdAt])
   @@map("reasoning_traces")
 }
 
 /// A subscriber copying an agent's trade
 model CopyTrade {
-  id         String         @id @default(uuid())
-  userId     String
-  traceId    String
-  marketId   String
-  tradeId    String?
-  direction  TradeDirection
-  amount     Float
-  amountRaw  String?
-  txHash     String?
-  builderFee Float          @default(0)
-  status     TradeStatus    @default(PENDING)
-  pnl        Float?
-  createdAt  DateTime       @default(now())
-  updatedAt  DateTime       @updatedAt
+  id                   String          @id @default(uuid())
+  userId               String
+  traceId              String
+  marketId             String
+  tradeId              String?
+  direction            TradeDirection
+  /// CHECK: copy_trades_amount_nonneg (amount >= 0)
+  amount               Float
+  /// CHECK: copy_trades_amount_raw_digits (amountRaw IS NULL OR digits only)
+  amountRaw            String?
+  /// CHECK: copy_trades_tx_hash_format (txHash IS NULL OR 64 hex chars)
+  txHash               String?         @unique
+  builderFee           Float           @default(0)
+  status               CopyTradeStatus @default(PENDING)
+  pnl                  Float?
+  collateralRaw        String?
+  sharesRaw            String?
+  feeRaw               String?
+  ledger               Int?
+  chainEventId         String?
+  confirmedAt          DateTime?
+  failureCode          String?
+  verificationAttempts Int             @default(0)
+  expiresAt            DateTime?
+  createdAt            DateTime        @default(now())
+  updatedAt            DateTime        @updatedAt
 
   user   User           @relation(fields: [userId], references: [id], onDelete: Cascade)
-  trace  ReasoningTrace @relation(fields: [traceId], references: [id], onDelete: Cascade)
-  market Market         @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  trace  ReasoningTrace @relation(fields: [traceId], references: [id], onDelete: Restrict)
+  market Market         @relation(fields: [marketId], references: [id], onDelete: Restrict)
   trade  Trade?         @relation(fields: [tradeId], references: [id])
 
   @@index([userId])
   @@index([traceId])
   @@index([status])
+  @@index([status, expiresAt])
   @@map("copy_trades")
 }
 
@@ -294,9 +373,11 @@ model Subscription {
   traceId    String?
   type       SubscriptionType
   status     SubscriptionStatus @default(ACTIVE)
+  /// CHECK: subscriptions_amount_paid_nonneg (amountPaid >= 0)
   amountPaid Float
-  currency   String             @default("USDC")
-  txHash     String?
+  currency   SettlementCurrency @default(USDC)
+  /// CHECK: subscriptions_tx_hash_format (txHash IS NULL OR 64 hex chars)
+  txHash     String?            @unique
   expiresAt  DateTime?
   createdAt  DateTime           @default(now())
   updatedAt  DateTime           @updatedAt
@@ -338,7 +419,6 @@ model SignalCache {
   expiresAt DateTime
 
   @@index([source, expiresAt])
-  // @@index([expiresAt])
   @@map("signal_cache")
 }
 
@@ -360,6 +440,7 @@ model ChainEvent {
   eventName      String
   ledger         Int
   ledgerClosedAt DateTime
+  /// CHECK: chain_events_tx_hash_format (64 hex chars)
   txHash         String
   /// Decoded event params (bigints as strings).
   params         Json
@@ -373,21 +454,24 @@ model ChainEvent {
 
 // Event emitted for every payment transaction related to subscriptions and copy trading
 model PaymentEvent {
-  id            String   @id @default(uuid())
+  id            String             @id @default(uuid())
   userId        String
-  txHash        String   @unique
-  type          String   // DAILY_PASS | PER_TRACE | REFUND
+  /// CHECK: payment_events_tx_hash_format (64 hex chars)
+  txHash        String             @unique
+  type          PaymentEventType
   amount        Float
+  /// CHECK: payment_events_amount_raw_digits (amountRaw IS NULL OR digits only)
   amountRaw     String?
   fromAddress   String?
-  currency      String   @default("USDC")
-  status        String   // PENDING | CONFIRMED | FAILED
+  currency      SettlementCurrency @default(USDC)
+  status        PaymentEventStatus @default(PENDING)
   traceId       String?
   metadata      Json?
-  createdAt     DateTime @default(now())
+  createdAt     DateTime           @default(now())
   confirmedAt   DateTime?
 
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user  User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  trace ReasoningTrace? @relation(fields: [traceId], references: [id], onDelete: SetNull)
 
   @@index([userId])
   @@index([txHash])
@@ -396,20 +480,71 @@ model PaymentEvent {
 
 // User-defined spending approvals for nanopayment trace access
 model SpendingAllowance {
-  id           String   @id @default(uuid())
-  userId       String   @unique
-  dailyLimit   Float
+  id            String             @id @default(uuid())
+  userId        String             @unique
+  /// CHECK: spending_allowances_daily_limit_nonneg (dailyLimit >= 0)
+  dailyLimit    Float
+  /// CHECK: spending_allowances_per_trace_limit_nonneg (perTraceLimit >= 0)
   perTraceLimit Float
-  spentToday   Float    @default(0)
-  currency     String   @default("USDC")
-  lastResetAt  DateTime @default(now())
-  isActive     Boolean  @default(true)
+  /// CHECK: spending_allowances_spent_today_nonneg (spentToday >= 0)
+  spentToday    Float              @default(0)
+  currency      SettlementCurrency @default(USDC)
+  lastResetAt   DateTime           @default(now())
+  isActive      Boolean            @default(true)
 
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
   @@map("spending_allowances")
+}
+
+/// Runs of the reasoning trace auditor
+model TraceAuditRun {
+  id            String    @id @default(uuid())
+  startedAt     DateTime  @default(now())
+  finishedAt    DateTime?
+  cursorTraceId BigInt?
+  stats         Json?
+
+  @@map("trace_audit_runs")
+}
+
+/// Audit findings per on-chain / DB trace
+model TraceAudit {
+  id              String           @id @default(uuid())
+  onChainTraceId  BigInt?
+  traceId         String?
+  onChainMarketId BigInt?
+  agent           String?
+  action          String?
+  ipfsCid         String?
+  onChainHash     String?
+  computedHash    String?
+  status          TraceAuditStatus
+  detail          Json?
+  runId           String
+  checkedAt       DateTime         @default(now())
+
+  trace ReasoningTrace? @relation(fields: [traceId], references: [id], onDelete: SetNull)
+
+  @@unique([onChainTraceId, runId])
+  @@index([status, checkedAt])
+  @@index([traceId, checkedAt])
+  @@map("trace_audits")
+}
+
+/// Rows violating constraints quarantined before repair
+model ConstraintQuarantine {
+  id        String   @id @default(uuid())
+  tableName String   @map("table_name")
+  rowId     String   @map("row_id")
+  checkName String   @map("check_name")
+  row       Json
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([tableName, checkName])
+  @@map("constraint_quarantine")
 }

@@ -22,6 +22,7 @@ function baseOptions(contractId: string, signer: Signer = {}): ClientOptions {
     rpcUrl: config.STELLAR_RPC_URL,
     networkPassphrase: config.STELLAR_NETWORK_PASSPHRASE,
     allowHttp: config.STELLAR_RPC_URL.startsWith('http://'),
+    timeoutInSeconds: Math.ceil(config.TIMEOUT_RPC_WRITE_MS / 1000),
     ...signer,
   };
 }

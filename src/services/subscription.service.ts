@@ -1,3 +1,10 @@
+import {
+  PaymentEventStatus,
+  PaymentEventType,
+  SettlementCurrency,
+  SubscriptionStatus,
+  SubscriptionType,
+} from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
 import { config } from '../config';
@@ -30,8 +37,8 @@ export async function checkAccess(
   const dailyPass = await prisma.subscription.findFirst({
     where: {
       userId,
-      type:   'DAILY_PASS',
-      status: 'ACTIVE',
+      type:   SubscriptionType.DAILY_PASS,
+      status: SubscriptionStatus.ACTIVE,
       expiresAt: { gt: new Date() },
     },
   });
@@ -45,8 +52,8 @@ export async function checkAccess(
     where: {
       userId,
       traceId,
-      type:   'PER_TRACE',
-      status: 'ACTIVE',
+      type:   SubscriptionType.PER_TRACE,
+      status: SubscriptionStatus.ACTIVE,
     },
   });
 
@@ -108,10 +115,10 @@ export async function recordPayment(params: {
       data: {
         userId,
         traceId:   traceId ?? null,
-        type,
-        status:    'ACTIVE',
+        type:      type as SubscriptionType,
+        status:    SubscriptionStatus.ACTIVE,
         amountPaid: amount,
-        currency:  'USDC',
+        currency:  SettlementCurrency.USDC,
         txHash,
         expiresAt,
       },
@@ -123,12 +130,12 @@ export async function recordPayment(params: {
         userId,
         traceId:     traceId ?? null,
         txHash,
-        type,
+        type:        type as PaymentEventType,
         amount,
         amountRaw:   transfer.amount.toString(),
         fromAddress: transfer.from,
-        currency:    'USDC',
-        status:      'CONFIRMED',
+        currency:    SettlementCurrency.USDC,
+        status:      PaymentEventStatus.CONFIRMED,
         confirmedAt: new Date(),
         metadata:    { subscriptionId: created.id, ledger: transfer.ledger } as any,
       },
@@ -170,8 +177,12 @@ export async function getTracWithAccessControl(
     access = fullAccess;
   }
 
+  const audit = trace.lastAuditStatus
+    ? { status: trace.lastAuditStatus, checkedAt: trace.lastAuditedAt }
+    : null;
+
   if (access.hasAccess) {
-    return { ...trace, accessLevel: access.accessType };
+    return { ...trace, audit, accessLevel: access.accessType };
   }
 
   // Return free preview — strip full sources
@@ -187,6 +198,7 @@ export async function getTracWithAccessControl(
     confidenceInterval:  trace.confidenceInterval,
     sourcesUsed:         trace.previewSources,  // Preview: only first 2 sources
     verified:            trace.verified,
+    audit,
     ipfsCid:             trace.ipfsCid,
     traceHash:           trace.traceHash,
     onChainTraceId:      trace.onChainTraceId,
@@ -265,10 +277,11 @@ async function enforceSpendingAllowance(
     await prisma.subscription.create({
       data: {
         userId,
-        type,
-        status: 'LIMIT_REACHED',
+        type: type as SubscriptionType,
+        status: SubscriptionStatus.LIMIT_REACHED,
         amountPaid: amount,
-        currency: allowance.currency,
+        currency: (allowance.currency as SettlementCurrency) || SettlementCurrency.USDC,
+        txHash: null,
       },
     });
     throw new AppError(402, 'ALLOWANCE_DAILY_LIMIT', 'Payment exceeds daily spending approval');

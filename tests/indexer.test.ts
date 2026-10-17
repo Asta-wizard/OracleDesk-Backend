@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { Contract, StrKey, xdr } from '@stellar/stellar-sdk';
+import { Address, Contract, StrKey, xdr } from '@stellar/stellar-sdk';
 import { setupTestEnv } from './helpers/env';
 
 setupTestEnv();
@@ -29,7 +29,8 @@ async function setup(events = FIXTURES.map(toEventResponse)) {
     markets: new Map<string, any>([
       ['m0', { id: 'm0', onChainMarketId: 0n, question: 'Market zero?', status: 'ACTIVE' }],
     ]),
-    traces: [{ id: 't0', traceHash: 'f4b58d4ac4068163f34bd9486f0563c70873afa5f64e915ab7e85af7dee15e4e', onChainTraceId: null as bigint | null }],
+    traces: [{ id: 't0', marketId: 'm0', market: { onChainMarketId: 0n }, traceHash: 'f4b58d4ac4068163f34bd9486f0563c70873afa5f64e915ab7e85af7dee15e4e', onChainTraceId: null as bigint | null }],
+    copyTrades: [] as any[],
     closedPositions: 0,
   };
   (prisma.chainEvent.create as any) = async ({ data }: any) => {
@@ -46,8 +47,28 @@ async function setup(events = FIXTURES.map(toEventResponse)) {
   (prisma.market.update as any) = async ({ where, data }: any) => Object.assign(db.markets.get(where.id), data);
   (prisma.position.updateMany as any) = async () => { db.closedPositions++; return { count: 1 }; };
   (prisma.$transaction as any) = async (ops: Promise<unknown>[]) => Promise.all(ops);
-  (prisma.reasoningTrace.findFirst as any) = async ({ where }: any) => db.traces.find((t) => t.traceHash === where.traceHash) ?? null;
+  (prisma.reasoningTrace.findFirst as any) = async ({ where }: any) => {
+    return db.traces.find((t) => {
+      if (t.traceHash !== where.traceHash) return false;
+      if (where.market?.onChainMarketId !== undefined && t.market?.onChainMarketId !== where.market.onChainMarketId) return false;
+      return true;
+    }) ?? null;
+  };
   (prisma.reasoningTrace.update as any) = async ({ where, data }: any) => Object.assign(db.traces.find((t) => t.id === where.id)!, data);
+  (prisma.copyTrade.findFirst as any) = async ({ where }: any) => {
+    return db.copyTrades.find((ct) => {
+      if (where.txHash && ct.txHash !== where.txHash) return false;
+      if (where.followerWallet && ct.followerWallet.toLowerCase() !== where.followerWallet.toLowerCase()) return false;
+      if (where.outcome && ct.outcome !== where.outcome) return false;
+      if (where.market?.onChainMarketId !== undefined && ct.market?.onChainMarketId !== where.market.onChainMarketId) return false;
+      return true;
+    }) ?? null;
+  };
+  (prisma.copyTrade.update as any) = async ({ where, data }: any) => {
+    const ct = db.copyTrades.find((c) => c.id === where.id);
+    if (ct) Object.assign(ct, data);
+    return ct;
+  };
 
   const calls: any[] = [];
   const source = {
@@ -123,4 +144,35 @@ test('events from other contracts are ignored', async () => {
   const r = await backfillEvents(undefined, { source, emit });
   assert.equal(r.seen, 1);
   assert.equal(r.stored, 0);
+});
+
+test('TracePublished does not link a trace whose market differs', async () => {
+  const { db, source, emit, backfillEvents } = await setup();
+  // Trace belongs to market with onChainMarketId 999, but event is for market 0
+  db.traces[0].market = { onChainMarketId: 999n };
+  db.traces[0].onChainTraceId = null;
+
+  await backfillEvents(undefined, { source, emit });
+  assert.equal(db.traces[0].onChainTraceId, null, 'trace must not be linked when on-chain market differs');
+});
+
+test('Trade event confirms a CONFIRMING copy trade with matching txHash', async () => {
+  const { db, source, emit, backfillEvents } = await setup();
+  const tradeEvent = FIXTURES[0]; // Trade event for market 0
+  const traderTopic = xdr.ScVal.fromXDR(tradeEvent.topic[2], 'base64');
+  const actualTrader = Address.fromScVal(traderTopic).toString();
+
+  db.copyTrades.push({
+    id: 'ct-1',
+    txHash: tradeEvent.txHash,
+    status: 'CONFIRMING',
+    followerWallet: actualTrader,
+    outcome: 'YES',
+    amountRaw: '1000000000',
+    market: { onChainMarketId: 0n },
+  });
+
+  await backfillEvents(undefined, { source, emit });
+  assert.equal(db.copyTrades[0].status, 'EXECUTED');
+  assert.equal(db.copyTrades[0].collateralRaw, '100000000');
 });

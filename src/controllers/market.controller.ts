@@ -407,7 +407,7 @@ export async function getOnChainMarketState(req: Request, res: Response): Promis
     sendError(res, 400, 'INVALID_MARKET_ID', 'onChainMarketId must be a decimal u64');
     return;
   }
-  const market = await getOnChainMarket(onChainMarketId);
+  const market = await getOnChainMarket(onChainMarketId, req.signal);
   sendSuccess(res, {
     onChainMarketId: raw,
     ...(printable({ ...market, status: undefined, category: market.category.tag }) as object),
