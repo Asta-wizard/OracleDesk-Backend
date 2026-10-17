@@ -4,7 +4,7 @@ This is the contract between `OracleDesk-Frontend` and this backend. The
 Soroban contracts in `OracleDesk-SmartContract/oracledesk-stellar` are the
 source of truth for anything on-chain; this API never overrides them.
 
-Base URL: `/api/v1` (health is at `/health`).
+Base URL: `/api/v1` (liveness is `/health`, readiness is `/readyz`).
 
 ## Conventions
 
@@ -128,6 +128,8 @@ useMutation({
 ### Health
 
 `GET /health` → `{ status: "healthy", uptime: number }`
+
+`GET /readyz` → `200` when the database is reachable, `503 NOT_READY` otherwise.
 
 ### Auth (signed challenge, SEP-10 style)
 

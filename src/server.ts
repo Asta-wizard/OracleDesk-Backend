@@ -2,6 +2,7 @@ import http from 'http';
 import { Server } from 'socket.io';
 import app from './app';
 import { config } from './config';
+import { initSecrets, startSecretRefresh } from './config/secrets';
 import { logger } from './lib/logger';
 import { prisma } from './lib/prisma';
 import { startIngestionCron } from './cron/ingestion.cron';
@@ -12,8 +13,18 @@ import { startEventListener } from './services/indexer.service';
 import { closeRedis } from './lib/redis';
 
 let stopEventListener: (() => void) | null = null;
+let stopSecretRefresh: (() => void) | null = null;
 
 async function bootstrap(): Promise<void> {
+  // 0. Resolve secrets (mounted files or the configured remote provider).
+  try {
+    await initSecrets(config);
+    stopSecretRefresh = startSecretRefresh(config);
+  } catch (err) {
+    logger.fatal({ err: err instanceof Error ? err.message : err }, 'Failed to initialise secrets');
+    process.exit(1);
+  }
+
   // 1. Connect to database
   try {
     await prisma.$connect();
@@ -75,6 +86,7 @@ async function bootstrap(): Promise<void> {
 
     server.close(async () => {
       if (stopEventListener) stopEventListener();
+      if (stopSecretRefresh) stopSecretRefresh();
 
       await prisma.$disconnect();
       await closeRedis();

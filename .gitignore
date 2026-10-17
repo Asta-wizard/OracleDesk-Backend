@@ -8,6 +8,7 @@ dist-tests
 recovery.dat
 
 # Build output and local artefacts
+.ipfs-local/
 dist/
 *.log
 .DS_Store

@@ -1,11 +1,45 @@
 import axios from 'axios';
+import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 import { config } from '../config';
+import { secret } from '../config/secrets';
 import { logger } from '../lib/logger';
 import { AppError } from '../middlewares/error.middleware';
 import { canonicalBytes, sha256Hex } from '../utils/hash.util';
 import { bulkheads, deadline, sleep, TimeoutError } from '../lib/resilience';
 
 const PINATA_BASE = 'https://api.pinata.cloud';
+
+/** RFC 4648 base32 (lowercase, no padding) used by CIDv1 multibase 'b'. */
+const BASE32 = 'abcdefghijklmnopqrstuvwxyz234567';
+
+export function base32Encode(bytes: Uint8Array): string {
+  let bits = 0;
+  let value = 0;
+  let output = '';
+  for (const byte of bytes) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      output += BASE32[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) output += BASE32[(value << (5 - bits)) & 31];
+  return output;
+}
+
+/**
+ * CIDv1(raw, sha2-256). This is the real value Pinata returns for a file
+ * pinned with `cidVersion: 1`; no dependency needed.
+ */
+export function cidForBytes(bytes: Buffer): string {
+  const digest = crypto.createHash('sha256').update(bytes).digest();
+  const multihash = Buffer.concat([Buffer.from([0x12, 0x20]), digest]);
+  const cidBytes = Buffer.concat([Buffer.from([0x01, 0x55]), multihash]);
+  return `b${base32Encode(cidBytes)}`;
+}
 
 /**
  * Where JSON documents are pinned. The default talks to Pinata; tests inject
@@ -20,7 +54,9 @@ export interface IpfsTransport {
 
 export const pinataTransport: IpfsTransport = {
   async pin(bytes, name, signal) {
-    if (!config.PINATA_API_KEY || !config.PINATA_SECRET_API_KEY) {
+    const apiKey = secret('PINATA_API_KEY');
+    const secretKey = secret('PINATA_SECRET_API_KEY');
+    if (!apiKey || !secretKey) {
       throw new AppError(503, 'IPFS_NOT_CONFIGURED', 'PINATA_API_KEY and PINATA_SECRET_API_KEY are not set');
     }
     // pinFileToIPFS stores the file's bytes verbatim. pinJSONToIPFS would
@@ -31,8 +67,8 @@ export const pinataTransport: IpfsTransport = {
     form.append('pinataOptions', JSON.stringify({ cidVersion: 1 }));
     const { data } = await axios.post<{ IpfsHash: string }>(`${PINATA_BASE}/pinning/pinFileToIPFS`, form, {
       headers: {
-        pinata_api_key: config.PINATA_API_KEY,
-        pinata_secret_api_key: config.PINATA_SECRET_API_KEY,
+        pinata_api_key: apiKey,
+        pinata_secret_api_key: secretKey,
       },
       timeout: config.TIMEOUT_IPFS_PIN_MS,
       signal,
@@ -75,7 +111,27 @@ export const pinataTransport: IpfsTransport = {
   },
 };
 
-let transport: IpfsTransport = pinataTransport;
+/** Development-only transport: stores bytes on disk under `<dir>/<cid>`. */
+export function localIpfsTransport(dir: string): IpfsTransport {
+  return {
+    async pin(bytes) {
+      const cid = cidForBytes(bytes);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, cid), bytes);
+      return cid;
+    },
+    async fetch(cid) {
+      try {
+        return fs.readFileSync(path.join(dir, cid));
+      } catch {
+        throw new AppError(404, 'IPFS_NOT_FOUND', 'Content is not in the local IPFS store', { cid });
+      }
+    },
+  };
+}
+
+let transport: IpfsTransport =
+  config.IPFS_TRANSPORT === 'local' ? localIpfsTransport(config.IPFS_LOCAL_DIR) : pinataTransport;
 
 /** Test seam. Returns the previous transport. */
 export function setIpfsTransport(next: IpfsTransport): IpfsTransport {

@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import dotenv from 'dotenv';
 import { Keypair, Networks, StrKey } from '@stellar/stellar-sdk';
 import { z } from 'zod';
+import { resolveFileVars, validateSecrets, SECRET_NAMES } from './secrets';
 
 dotenv.config();
 
@@ -54,6 +55,24 @@ const envSchema = z
     // G… addresses allowed to call admin endpoints.
     ADMIN_ADDRESSES: commaList(stellarAccount),
 
+    // ── Secrets (#145) ────────────────────────────────────────────────────
+    // env: process environment (default); file: <NAME>_FILE mounts; vault:
+    // Vault KV v2, refreshed every SECRETS_REFRESH_MS.
+    SECRETS_PROVIDER: z.enum(['env', 'file', 'vault']).default('env'),
+    SECRETS_REFRESH_MS: z
+      .string()
+      .default('300000')
+      .transform(Number)
+      .refine((v) => Number.isFinite(v) && v >= 30000, 'must be at least 30000 ms'),
+    JWT_PREVIOUS_SECRET_GRACE_SECS: z
+      .string()
+      .default('86400')
+      .transform(Number)
+      .refine((v) => Number.isFinite(v) && v >= 0, 'must be a non-negative integer'),
+    VAULT_ADDR: optionalString,
+    VAULT_TOKEN_FILE: optionalString,
+    VAULT_KV_PATH: optionalString,
+
     // ── Stellar ───────────────────────────────────────────────────────────
     STELLAR_RPC_URL: z.string().url().default('https://soroban-testnet.stellar.org'),
     STELLAR_NETWORK_PASSPHRASE: z.string().default(Networks.TESTNET),
@@ -90,6 +109,9 @@ const envSchema = z
     PINATA_API_KEY: optionalString,
     PINATA_SECRET_API_KEY: optionalString,
     IPFS_GATEWAY_URL: z.string().url().default('https://gateway.pinata.cloud/ipfs'),
+    // #147 — development-only local IPFS stub selected explicitly.
+    IPFS_TRANSPORT: z.enum(['pinata', 'local']).default('pinata'),
+    IPFS_LOCAL_DIR: z.string().default('.ipfs-local'),
 
     // ── Data sources ──────────────────────────────────────────────────────
     NEWSAPI_KEY: optionalString,
@@ -145,18 +167,14 @@ const envSchema = z
     COPY_TRADE_MAX_PENDING: z.string().default('5').transform(Number),
   })
   .superRefine((env, ctx) => {
-    if (env.JWT_SECRET && env.JWT_SECRET.length < 32) {
-      ctx.addIssue({ code: 'custom', path: ['JWT_SECRET'], message: 'must be at least 32 characters' });
+    if (env.SECRETS_PROVIDER === 'vault') {
+      if (!env.VAULT_ADDR) ctx.addIssue({ code: 'custom', path: ['VAULT_ADDR'], message: 'is required when SECRETS_PROVIDER=vault' });
+      else if (!URL.canParse(env.VAULT_ADDR)) ctx.addIssue({ code: 'custom', path: ['VAULT_ADDR'], message: 'must be a URL' });
+      if (!env.VAULT_TOKEN_FILE) ctx.addIssue({ code: 'custom', path: ['VAULT_TOKEN_FILE'], message: 'is required when SECRETS_PROVIDER=vault' });
+      if (!env.VAULT_KV_PATH) ctx.addIssue({ code: 'custom', path: ['VAULT_KV_PATH'], message: 'is required when SECRETS_PROVIDER=vault' });
     }
-    if (env.NODE_ENV === 'production') {
-      for (const key of ['JWT_SECRET', 'AUTH_SIGNING_SECRET'] as const) {
-        if (!env[key]) ctx.addIssue({ code: 'custom', path: [key], message: 'is required in production' });
-      }
-    }
-    for (const key of ['AUTH_SIGNING_SECRET', 'AGENT_SECRET_KEY'] as const) {
-      if (env[key] && !StrKey.isValidEd25519SecretSeed(env[key])) {
-        ctx.addIssue({ code: 'custom', path: [key], message: 'must be a Stellar secret seed (S…)' });
-      }
+    if (env.NODE_ENV === 'production' && env.IPFS_TRANSPORT === 'local') {
+      ctx.addIssue({ code: 'custom', path: ['IPFS_TRANSPORT'], message: 'local IPFS is development-only' });
     }
     if (env.CHAIN_EXECUTION_MODE === 'live') {
       if (!env.AGENT_SECRET_KEY) {
@@ -181,22 +199,49 @@ export class ConfigError extends Error {}
 
 /** Parses an env object. Throws ConfigError naming every bad variable. */
 export function loadConfig(env: NodeJS.ProcessEnv): Config {
-  const parsed = envSchema.safeParse(env);
+  let resolvedEnv: NodeJS.ProcessEnv;
+  try {
+    resolvedEnv = resolveFileVars(env);
+  } catch (err) {
+    throw new ConfigError(`Invalid environment configuration:\n  ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  const parsed = envSchema.safeParse(resolvedEnv);
   if (!parsed.success) {
     const lines = parsed.error.issues.map((i) => `  ${i.path.join('.') || '(root)'} ${i.message}`);
     throw new ConfigError(`Invalid environment configuration:\n${lines.join('\n')}`);
   }
   const data = parsed.data;
+  // Using <NAME>_FILE implies the file provider, so refresh re-reads the
+  // mounts instead of the (possibly empty) plain environment variable.
+  if (
+    data.SECRETS_PROVIDER === 'env' &&
+    SECRET_NAMES.some((name) => Boolean(resolvedEnv[`${name}_FILE`]))
+  ) {
+    data.SECRETS_PROVIDER = 'file';
+  }
+
+  const problems = validateSecrets(data, data.NODE_ENV, {
+    // A remote provider supplies secret values after loadConfig; boot-time
+    // presence checks move to initSecrets().
+    requireProductionSecrets: data.SECRETS_PROVIDER !== 'vault',
+  });
+  if (problems.length > 0) {
+    throw new ConfigError(`Invalid environment configuration:\n${problems.map((p) => `  ${p}`).join('\n')}`);
+  }
+
   const ephemeralSecrets: string[] = [];
-  if (!data.JWT_SECRET) {
+  if (!data.JWT_SECRET && data.NODE_ENV !== 'production') {
     data.JWT_SECRET = crypto.randomBytes(32).toString('hex');
     ephemeralSecrets.push('JWT_SECRET');
   }
-  if (!data.AUTH_SIGNING_SECRET) {
+  if (!data.AUTH_SIGNING_SECRET && data.NODE_ENV !== 'production') {
     data.AUTH_SIGNING_SECRET = Keypair.random().secret();
     ephemeralSecrets.push('AUTH_SIGNING_SECRET');
   }
   if (!data.AUTH_WEB_AUTH_DOMAIN) data.AUTH_WEB_AUTH_DOMAIN = data.AUTH_HOME_DOMAIN;
+  // Prisma's env("DATABASE_URL") reads this process-wide value at client build.
+  if (data.DATABASE_URL) process.env.DATABASE_URL = data.DATABASE_URL;
   return { ...data, ephemeralSecrets };
 }
 
