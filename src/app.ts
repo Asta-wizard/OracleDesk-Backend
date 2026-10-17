@@ -32,6 +32,9 @@ app.use(cors({
     callback(null, false);
   },
   credentials: true,
+  // #123: let browsers send Idempotency-Key and read Idempotent-Replayed.
+  allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key'],
+  exposedHeaders: ['Idempotent-Replayed', 'Retry-After'],
 }));
 
 // ─── Rate Limiting ───

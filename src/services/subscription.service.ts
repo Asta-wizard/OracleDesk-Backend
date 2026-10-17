@@ -72,6 +72,10 @@ export async function checkAccess(
  * (payment-verification.service.ts). Each transaction hash is used once.
  * Per-trace unlocks go through the x402 service instead.
  */
+function isUniqueViolation(err: unknown): boolean {
+  return (err as { code?: unknown } | null)?.code === 'P2002';
+}
+
 export async function recordPayment(params: {
   userId:        string;
   walletAddress: string;
@@ -110,44 +114,60 @@ export async function recordPayment(params: {
 
   const expiresAt = dayjs().add(24, 'hour').toDate();
 
-  const subscription = await prisma.$transaction(async (tx) => {
-    const created = await tx.subscription.create({
-      data: {
-        userId,
-        traceId:   traceId ?? null,
-        type:      type as SubscriptionType,
-        status:    SubscriptionStatus.ACTIVE,
-        amountPaid: amount,
-        currency:  SettlementCurrency.USDC,
-        txHash,
-        expiresAt,
-      },
-    });
+  let subscription;
+  try {
+    subscription = await prisma.$transaction(async (tx) => {
+      const created = await tx.subscription.create({
+        data: {
+          userId,
+          traceId:   traceId ?? null,
+          type:      type as SubscriptionType,
+          status:    SubscriptionStatus.ACTIVE,
+          amountPaid: amount,
+          currency:  SettlementCurrency.USDC,
+          txHash,
+          expiresAt,
+        },
+      });
 
-    // Unique on txHash: a concurrent request with the same hash fails here.
-    await tx.paymentEvent.create({
-      data: {
-        userId,
-        traceId:     traceId ?? null,
-        txHash,
-        type:        type as PaymentEventType,
-        amount,
-        amountRaw:   transfer.amount.toString(),
-        fromAddress: transfer.from,
-        currency:    SettlementCurrency.USDC,
-        status:      PaymentEventStatus.CONFIRMED,
-        confirmedAt: new Date(),
-        metadata:    { subscriptionId: created.id, ledger: transfer.ledger } as any,
-      },
-    });
+      // Unique on txHash: a concurrent request with the same hash fails here.
+      await tx.paymentEvent.create({
+        data: {
+          userId,
+          traceId:     traceId ?? null,
+          txHash,
+          type:        type as PaymentEventType,
+          amount,
+          amountRaw:   transfer.amount.toString(),
+          fromAddress: transfer.from,
+          currency:    SettlementCurrency.USDC,
+          status:      PaymentEventStatus.CONFIRMED,
+          confirmedAt: new Date(),
+          metadata:    { subscriptionId: created.id, ledger: transfer.ledger } as any,
+        },
+      });
 
-    await tx.spendingAllowance.updateMany({
-      where: { userId, isActive: true },
-      data: { spentToday: { increment: amount } },
-    });
+      await tx.spendingAllowance.updateMany({
+        where: { userId, isActive: true },
+        data: { spentToday: { increment: amount } },
+      });
 
-    return created;
-  });
+      return created;
+    });
+  } catch (err) {
+    // #123: a concurrent duplicate with the same txHash loses the unique race
+    // on PaymentEvent.txHash (P2002). Resolve it like the pre-check above
+    // instead of surfacing a 500, with or without an Idempotency-Key.
+    if (isUniqueViolation(err)) {
+      const winner = await prisma.paymentEvent.findUnique({ where: { txHash } });
+      if (winner?.userId === userId) {
+        const sub = await prisma.subscription.findFirst({ where: { txHash } });
+        if (sub) return sub;
+      }
+      throw new AppError(409, 'PAYMENT_ALREADY_USED', 'This payment has already been used');
+    }
+    throw err;
+  }
 
   logger.info({ subscriptionId: subscription.id, type, userId, amountRaw: transfer.amount.toString() }, 'Subscription created');
   return subscription;
