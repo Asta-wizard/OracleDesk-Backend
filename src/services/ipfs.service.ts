@@ -3,6 +3,7 @@ import { config } from '../config';
 import { logger } from '../lib/logger';
 import { AppError } from '../middlewares/error.middleware';
 import { canonicalBytes, sha256Hex } from '../utils/hash.util';
+import { getContentStore } from './content-store.service';
 
 const PINATA_BASE = 'https://api.pinata.cloud';
 
@@ -78,6 +79,13 @@ export async function pinJson(document: unknown, name: string): Promise<PinnedDo
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const cid = await transport.pin(bytes, name);
+      // Write-through: the pin succeeded, so a cache failure must not fail the
+      // caller (the CID/hash are still returned and persisted).
+      await getContentStore()
+        .put({ cid, sha256: hash, bytes, origin: 'PINNED', verifiedBy: 'pin' })
+        .catch((err) => {
+          logger.warn({ err, cid, name }, 'IPFS content store write failed; continuing');
+        });
       logger.info({ name, cid, hash }, 'Pinned to IPFS');
       return { cid, hash, bytes };
     } catch (err) {
@@ -96,4 +104,44 @@ export async function pinJson(document: unknown, name: string): Promise<PinnedDo
 
 export function fetchIpfsBytes(cid: string): Promise<Buffer> {
   return transport.fetch(cid);
+}
+
+/**
+ * Returns bytes for `cid` only if they match `expectedSha256` (the on-chain
+ * hash or the hash computed at pin time). Cache hits are re-hashed on read;
+ * a cached row with a different hash is ignored and never served. Gateway
+ * bytes are stored only after they verify. Bytes that fail verification are
+ * still returned (so callers can report `verified: false`) but never cached.
+ */
+export async function fetchVerifiedBytes(
+  cid: string,
+  expectedSha256: string,
+  verifiedBy: string,
+): Promise<{ bytes: Buffer; source: 'cache' | 'gateway' }> {
+  const expected = expectedSha256.toLowerCase().replace(/^0x/, '');
+  const store = getContentStore();
+
+  const cached = await store.get(cid);
+  if (cached) {
+    const storedHash = cached.sha256.toLowerCase().replace(/^0x/, '');
+    if (storedHash === expected && sha256Hex(cached.bytes) === expected) {
+      await store.touch(cid).catch(() => undefined);
+      return { bytes: cached.bytes, source: 'cache' };
+    }
+    logger.warn(
+      { cid, expected, stored: cached.sha256 },
+      'Cached IPFS content hash does not match expected hash; consulting gateway',
+    );
+  }
+
+  const bytes = await transport.fetch(cid);
+  const matches = sha256Hex(bytes) === expected;
+  if (matches && bytes.length <= config.IPFS_CACHE_MAX_OBJECT_BYTES) {
+    await store
+      .put({ cid, sha256: expected, bytes, origin: 'GATEWAY_VERIFIED', verifiedBy })
+      .catch((err) => logger.warn({ err, cid }, 'Failed to cache verified gateway bytes'));
+  } else if (!matches) {
+    logger.warn({ cid, expected, computed: sha256Hex(bytes) }, 'Gateway bytes failed hash verification; not cached');
+  }
+  return { bytes, source: 'gateway' };
 }

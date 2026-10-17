@@ -2,6 +2,8 @@ import cron from 'node-cron';
 import { runTraderCycle } from '../agents/trader.agent';
 import { expireStaleSubscriptions } from '../services/subscription.service';
 import { logger } from '../lib/logger';
+import { config } from '../config';
+import { postgresContentStore } from '../services/content-store.service';
 
 let traderRunning = false;
 
@@ -38,6 +40,16 @@ export function startMonitorCron(): void {
       await expireStaleSubscriptions();
     } catch (err) {
       logger.error({ err }, 'Monitor cron: subscription expiry failed');
+    }
+  });
+
+  // IPFS content eviction (#100) — hourly at :30, bounded batches.
+  cron.schedule('30 * * * *', async () => {
+    try {
+      const result = await postgresContentStore.evict(config.IPFS_CACHE_BUDGET_BYTES);
+      if (result.removed > 0) logger.info(result, 'Monitor cron: evicted IPFS content');
+    } catch (err) {
+      logger.error({ err }, 'Monitor cron: IPFS content eviction failed');
     }
   });
 

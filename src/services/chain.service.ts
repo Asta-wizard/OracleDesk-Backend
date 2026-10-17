@@ -21,8 +21,9 @@ import { config } from '../config';
 import { logger } from '../lib/logger';
 import { agentClients, readClients } from './stellar/clients';
 import { ChainError, contractErrorName } from './stellar/errors';
-import type { Category, Market as OnChainMarket, Outcome, Position } from '../generated/market-core';
+import type { Category, Config as MarketCoreConfig, Market as OnChainMarket, Outcome, Position } from '../generated/market-core';
 import type { Trace } from '../generated/reasoning-registry';
+import type { DailyUsage, RiskConfig } from '../generated/treasury';
 import type { ResolutionState } from '../generated/resolver';
 
 type ContractKey = 'marketCore' | 'treasury' | 'resolver' | 'reasoningRegistry';
@@ -155,6 +156,15 @@ export const resolverState = (marketId: bigint) =>
 
 export const treasuryAvailableCapital = () =>
   read<bigint>('treasury', 'available_capital', async () => readClients.treasury().available_capital());
+
+export const treasuryConfig = () =>
+  read<RiskConfig>('treasury', 'get_config', async () => readClients.treasury().get_config());
+
+export const treasuryDailyUsage = () =>
+  read<DailyUsage>('treasury', 'daily_usage', async () => readClients.treasury().daily_usage());
+
+export const marketCoreConfig = () =>
+  read<MarketCoreConfig>('marketCore', 'get_config', async () => readClients.marketCore().get_config());
 
 // ─── Writes (through the treasury) ───────────────────────────────────────────
 

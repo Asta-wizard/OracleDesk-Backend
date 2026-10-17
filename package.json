@@ -13,7 +13,8 @@
     "prisma:generate": "prisma generate",
     "prisma:studio": "prisma studio",
     "sync:contracts": "node scripts/sync-contracts.mjs",
-    "check:contracts": "node scripts/sync-contracts.mjs --check"
+    "check:contracts": "node scripts/sync-contracts.mjs --check",
+    "verify:report": "node -r ts-node/register/transpile-only scripts/verify-report.ts"
   },
   "keywords": [],
   "author": "",

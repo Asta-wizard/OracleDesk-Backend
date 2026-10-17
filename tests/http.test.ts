@@ -56,3 +56,15 @@ test('BigInt values serialise as decimal strings', async () => {
   const replacer = app.get('json replacer');
   assert.equal(JSON.stringify({ id: 18446744073709551615n }, replacer), '{"id":"18446744073709551615"}');
 });
+
+test('admin treasury routes require an admin (#156)', async () => {
+  const { signToken } = await import('../src/middlewares/auth.middleware');
+  await withServer(async (base) => {
+    const anon = await fetch(`${base}/api/v1/admin/treasury`);
+    assert.equal(anon.status, 401);
+    const token = signToken('u1', Keypair.random().publicKey());
+    const nonAdmin = await fetch(`${base}/api/v1/admin/treasury`, { headers: { authorization: `Bearer ${token}` } });
+    assert.equal(nonAdmin.status, 403);
+    assert.equal((await nonAdmin.json()).error.code, 'FORBIDDEN');
+  });
+});
