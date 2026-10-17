@@ -68,3 +68,19 @@ jobs:
         env:
           TEST_DATABASE_URL: postgresql://oracledesk:oracledesk@localhost:5432/postgres
           TEST_REDIS_URL: redis://localhost:6379
+
+  migrations:
+    name: Migration lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Lint new migrations
+        run: npm run lint:migrations

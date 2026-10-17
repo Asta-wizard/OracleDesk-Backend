@@ -321,6 +321,18 @@ export function decodedFromStored(row: {
   };
 }
 
+// Poll state for health reporting (#111); module-level because one indexer runs per process.
+const pollState: { lastLedger: number | null; updatedAt: string | null; lastPollAt: string | null; lastPollError: string | null } = {
+  lastLedger: null,
+  updatedAt: null,
+  lastPollAt: null,
+  lastPollError: null,
+};
+
+export function indexerStatus() {
+  return { enabled: config.INDEXER_ENABLED, ...pollState };
+}
+
 /** Polls every INDEXER_POLL_MS. Returns a stop function. */
 export function startEventListener(emit: IndexerDeps['emit']): () => void {
   if (!config.INDEXER_ENABLED) {
@@ -329,16 +341,18 @@ export function startEventListener(emit: IndexerDeps['emit']): () => void {
   }
   let stopped = false;
   let timer: NodeJS.Timeout | null = null;
-  const tick = (): Promise<void> => {
-    const cycleId = newId('cyc');
-    return runWithContext({ requestId: cycleId, cycleId, kind: 'indexer' }, async () => {
-      try {
-        await backfillEvents(undefined, { source: rpcServer, emit });
-      } catch (err) {
-        logger.warn({ err: err instanceof Error ? err.message : err }, 'Indexer poll failed; will retry');
-      }
-      if (!stopped) timer = setTimeout(tick, config.INDEXER_POLL_MS);
-    });
+  const tick = async () => {
+    try {
+      const result = await backfillEvents(undefined, { source: rpcServer, emit });
+      pollState.lastLedger = result.lastLedger;
+      pollState.updatedAt = new Date().toISOString();
+      pollState.lastPollError = null;
+    } catch (err) {
+      pollState.lastPollError = err instanceof Error ? err.message : String(err);
+      logger.warn({ err: err instanceof Error ? err.message : err }, 'Indexer poll failed; will retry');
+    }
+    pollState.lastPollAt = new Date().toISOString();
+    if (!stopped) timer = setTimeout(tick, config.INDEXER_POLL_MS);
   };
   void tick();
   logger.info({ pollMs: config.INDEXER_POLL_MS }, 'Stellar event indexer started');

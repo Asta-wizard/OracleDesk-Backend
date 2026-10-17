@@ -5,7 +5,6 @@ import compression from 'compression';
 import hpp from 'hpp';
 
 import { config } from './config';
-import { prisma } from './lib/prisma';
 import { logger } from './lib/logger';
 import { acceptInboundId, currentContext, newId, runInContext, runWithContext } from './lib/context';
 import { sendError } from './utils/response.util';
@@ -13,25 +12,17 @@ import { errorMiddleware } from './middlewares/error.middleware';
 import { globalLimiter } from './middlewares/rate-limit.middleware';
 import { abortMiddleware } from './middlewares/abort.middleware';
 import router from './routes';
+import { createHealthRouter } from './routes/health.routes';
+import { health } from './services/health.service';
 
 const app = express();
 
 // BigInt (u64 market ids, i128 amounts) serialises as a decimal string.
 app.set('json replacer', (_key: string, value: unknown) => (typeof value === 'bigint' ? value.toString() : value));
 
-// ─── Correlation id ───
-// First, so even requests rejected by helmet/CORS/body parsing carry an id.
-app.use((req, res, next) => {
-  const raw = req.get('x-request-id');
-  const inbound = acceptInboundId(raw);
-  if (raw && !inbound) logger.debug({ length: raw.length }, 'Ignoring malformed X-Request-Id'); // never log the value
-  const requestId = inbound ?? newId('req');
-  res.setHeader('X-Request-Id', requestId);
-  runWithContext({ requestId, kind: 'http' }, () => {
-    res.locals.requestContext = currentContext();
-    next();
-  });
-});
+// ─── Liveness / Readiness (#111) ───
+// Before the rate limiter, compression and CORS: orchestrators poll often from one IP.
+app.use(createHealthRouter(health));
 
 // ─── Security ───
 app.use(helmet());
@@ -92,19 +83,11 @@ app.use((req, res, next) => {
 app.use(abortMiddleware);
 
 // ─── Health Check ───
+// Deprecated in favour of /livez and /readyz; response shape is unchanged.
 app.get('/health', (_req, res) => {
+  res.setHeader('Deprecation', 'true');
+  res.setHeader('Link', '</readyz>; rel="successor-version"');
   res.json({ ok: true, data: { status: 'healthy', uptime: process.uptime() }, error: null });
-});
-
-// Readiness for rolling deploys (#144): the process is only ready when it can
-// reach the database. Keep this cheap — it runs every few seconds.
-app.get('/readyz', async (_req, res) => {
-  try {
-    await prisma.$queryRaw`SELECT 1`;
-    res.json({ ok: true, data: { status: 'ready' }, error: null });
-  } catch {
-    sendError(res, 503, 'NOT_READY', 'Database is not reachable');
-  }
 });
 
 // ─── API Routes ───
