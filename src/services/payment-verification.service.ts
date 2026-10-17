@@ -4,20 +4,18 @@
  * the tier price. There is no bypass: if this can't prove the payment, the
  * payment grants nothing. Tests inject a fake RPC client.
  */
-import { Address, rpc, scValToNative, xdr } from '@stellar/stellar-sdk';
+import { Address, rpc, scValToNative } from '@stellar/stellar-sdk';
 import { AppError } from '../middlewares/error.middleware';
 import { rpcServer } from './stellar/clients';
+import {
+  innerTransaction,
+  TransactionReader,
+  getTransactionReader,
+  setTransactionReader,
+} from './stellar/tx-inspect';
+import { withTimeout, TimeoutError } from '../lib/resilience';
 
-export interface TransactionReader {
-  getTransaction(hash: string): Promise<rpc.Api.GetTransactionResponse>;
-}
-
-let reader: TransactionReader = rpcServer;
-export function setTransactionReader(next: TransactionReader): TransactionReader {
-  const prev = reader;
-  reader = next;
-  return prev;
-}
+export { innerTransaction, TransactionReader, setTransactionReader };
 
 export interface VerifiedTransfer {
   txHash: string;
@@ -38,26 +36,25 @@ export interface ExpectedTransfer {
 const fail = (code: string, message: string, details?: Record<string, unknown>) =>
   new AppError(402, code, message, details);
 
-function innerTransaction(envelope: xdr.TransactionEnvelope): xdr.Transaction {
-  switch (envelope.switch().name) {
-    case 'envelopeTypeTx':
-      return envelope.v1().tx();
-    case 'envelopeTypeTxFeeBump':
-      return envelope.feeBump().tx().innerTx().v1().tx();
-    default:
-      throw fail('PAYMENT_WRONG_TOKEN', 'Unsupported transaction envelope');
-  }
-}
-
-export async function verifyUsdcTransfer(expected: ExpectedTransfer): Promise<VerifiedTransfer> {
+export async function verifyUsdcTransfer(
+  expected: ExpectedTransfer,
+  signal?: AbortSignal,
+): Promise<VerifiedTransfer> {
   if (!/^[0-9a-f]{64}$/.test(expected.txHash)) {
     throw new AppError(400, 'VALIDATION_ERROR', 'txHash must be a 64-character lowercase hex Stellar transaction hash');
   }
 
   let response: rpc.Api.GetTransactionResponse;
   try {
-    response = await reader.getTransaction(expected.txHash);
-  } catch (err) {
+    response = await withTimeout(
+      'rpc-read',
+      async () => getTransactionReader().getTransaction(expected.txHash),
+      { signal },
+    );
+  } catch (err: any) {
+    if (err instanceof TimeoutError || err?.code === 'UPSTREAM_TIMEOUT') {
+      throw new AppError(502, 'CHAIN_READ_FAILED', 'Stellar RPC read timed out', { timeout: true });
+    }
     throw new AppError(502, 'CHAIN_READ_FAILED', 'Could not reach Stellar RPC to verify the payment', {
       cause: err instanceof Error ? err.message : String(err),
     });
@@ -98,11 +95,17 @@ export async function verifyUsdcTransfer(expected: ExpectedTransfer): Promise<Ve
     throw fail('PAYMENT_WRONG_RECIPIENT', 'The payment was sent to the wrong recipient');
   }
   if (typeof amount !== 'bigint' || amount < expected.minAmount) {
-    throw fail('PAYMENT_INSUFFICIENT', 'The payment is less than the price', {
-      paidRaw: String(amount),
-      requiredRaw: expected.minAmount.toString(),
+    throw fail('PAYMENT_INSUFFICIENT', 'Payment amount is less than the required tier price', {
+      expected: expected.minAmount.toString(),
+      actual: typeof amount === 'bigint' ? amount.toString() : String(amount),
     });
   }
 
-  return { txHash: expected.txHash, from, to, amount, ledger: response.ledger };
+  return {
+    txHash: expected.txHash,
+    from,
+    to,
+    amount,
+    ledger: response.ledger,
+  };
 }

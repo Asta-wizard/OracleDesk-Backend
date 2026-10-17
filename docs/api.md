@@ -275,6 +275,7 @@ was simulated, not submitted.
   "marketProbability": 0.5,
   "confidenceInterval": { "lower": 0.55, "upper": 0.7 },
   "verified": true,
+  "audit": { "status": "VERIFIED", "checkedAt": "…" },
   "ipfsCid": "bafy…",
   "traceHash": "64-hex",
   "onChainTraceId": "3",
@@ -415,7 +416,8 @@ and `trade { direction, amount, edgeDetected, kellyFraction, txHash }`.
 #### `GET /portfolio/stats`
 
 Platform counts from the database only:
-`{ subscriberCount, totalCopyVolume, builderFees, marketCount, onChainMarketCount, traceCount }`.
+`{ subscriberCount, totalCopyVolume, totalCopyVolumeRaw, builderFees, marketCount, onChainMarketCount, traceCount }`.
+`totalCopyVolumeRaw` is the exact base-unit sum of `collateralRaw` for verified `EXECUTED` copy trades as a decimal string.
 The version in the unpushed commit `207464d` padded these with constants
 (`+1284` subscribers, `+142000` volume); this one doesn't.
 
@@ -432,6 +434,7 @@ Response:
 ```json
 {
   "copyTradeId": "uuid",
+  "expiresAt": "2026-10-17T03:30:00.000Z",
   "transactionPayload": {
     "contractId": "C… (market-core)",
     "onChainMarketId": "0",
@@ -440,19 +443,48 @@ Response:
     "userWallet": "G…",
     "traceReference": "bafy…"
   },
-  "instructions": "Quote, then sign market_core.buy with min_shares_out from the quote."
+  "instructions": "Quote, then sign market_core.buy with min_shares_out from the quote. Then call PATCH /trade/copy/:id/confirm with the transaction hash."
 }
 ```
 
 The direction comes from the trace's edge. The server refuses when there's
-no trace, the edge is zero, or the market has no `onChainMarketId`
-(`409 MARKET_NOT_ON_CHAIN`, `422 NO_EDGE`). `min_shares_out` isn't in the
-payload because it must come from a quote taken right before signing.
+no trace, the edge is zero, the market has no `onChainMarketId`
+(`409 MARKET_NOT_ON_CHAIN`, `422 NO_EDGE`), or the user has reached the open copy trade
+limit (`429 COPY_TRADE_LIMIT_REACHED` when ≥ `COPY_TRADE_MAX_PENDING` open trades exist).
+Unconfirmed trades expire after `COPY_TRADE_TTL_MINUTES` (default 30).
+`min_shares_out` isn't in the payload because it must come from a quote taken right before signing.
 
 #### `PATCH /trade/copy/:id/confirm` (auth)
 
-Request `{ txHash }`. Stored as `EXECUTED`; the indexer reconciles it against
-the market-core `trade` event.
+Request `{ "txHash": "64-hex" }`.
+
+The backend verifies the transaction on-chain via Stellar RPC:
+- Checks that the transaction succeeded.
+- Decodes contract events emitted by `CONTRACTS.marketCore`.
+- Asserts that a `Trade` event exists for the user's wallet (`trader`), the copy trade's `onChainMarketId`, the requested outcome, and `is_buy: true`.
+- Asserts that executed `collateral` does not exceed `amountRaw`.
+- Checks the transaction envelope (direct `marketCore.buy` call or smart wallet routing).
+- Re-use of a `txHash` across multiple copy trades is forbidden and returns `409 COPY_TRADE_TX_ALREADY_USED`.
+
+If the transaction has not yet been indexed or seen by Stellar RPC, the endpoint returns:
+`202 Accepted` with `{ "status": "CONFIRMING", "retryAfterSeconds": 5 }`.
+Pending / confirming copy trades are automatically reconciled when the indexer receives the `Trade` event, or during the 5-minute background sweep.
+
+Once confirmed, the copy trade is stored with `status: "EXECUTED"`, and records `collateralRaw`, `sharesRaw`, `feeRaw`, `ledger`, `chainEventId`, and `confirmedAt` directly from the on-chain event.
+
+### Admin (admin auth)
+
+Admin routes require a valid JWT whose `walletAddress` is present in `ADMIN_ADDRESSES`.
+
+#### `GET /admin/trace-audit` (admin)
+
+Returns summary metrics across all trace audits, details of the latest audit run, and paginated non-verified findings.
+Query parameters: `page`, `limit`, `status`.
+
+#### `POST /admin/trace-audit/run` (admin)
+
+Schedules a trace audit run asynchronously in the background.
+Response `202 Accepted`: `{ "runId": "uuid", "message": "Trace audit run scheduled" }`.
 
 ### Oracle / resolution
 

@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
 
 jobs:
@@ -53,5 +53,9 @@ jobs:
 
       - run: npx prisma generate
       - run: npx prisma migrate deploy
+      - name: Verify schema datamodel matches migrations
+        run: npx prisma migrate diff --from-migrations prisma/migrations --to-schema-datamodel prisma/schema.prisma --exit-code
+      - name: Audit database constraints
+        run: npx tsx scripts/audit-constraints.ts --json audit.json
       - run: npm run build
       - run: npm test

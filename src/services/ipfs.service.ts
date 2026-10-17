@@ -3,6 +3,7 @@ import { config } from '../config';
 import { logger } from '../lib/logger';
 import { AppError } from '../middlewares/error.middleware';
 import { canonicalBytes, sha256Hex } from '../utils/hash.util';
+import { bulkheads, deadline, sleep, TimeoutError } from '../lib/resilience';
 
 const PINATA_BASE = 'https://api.pinata.cloud';
 
@@ -12,13 +13,13 @@ const PINATA_BASE = 'https://api.pinata.cloud';
  */
 export interface IpfsTransport {
   /** Pins `bytes` exactly as given and returns the CID. */
-  pin(bytes: Buffer, name: string): Promise<string>;
+  pin(bytes: Buffer, name: string, signal?: AbortSignal): Promise<string>;
   /** Returns the exact bytes stored under `cid`. */
-  fetch(cid: string): Promise<Buffer>;
+  fetch(cid: string, signal?: AbortSignal): Promise<Buffer>;
 }
 
 export const pinataTransport: IpfsTransport = {
-  async pin(bytes, name) {
+  async pin(bytes, name, signal) {
     if (!config.PINATA_API_KEY || !config.PINATA_SECRET_API_KEY) {
       throw new AppError(503, 'IPFS_NOT_CONFIGURED', 'PINATA_API_KEY and PINATA_SECRET_API_KEY are not set');
     }
@@ -33,23 +34,43 @@ export const pinataTransport: IpfsTransport = {
         pinata_api_key: config.PINATA_API_KEY,
         pinata_secret_api_key: config.PINATA_SECRET_API_KEY,
       },
-      timeout: 20_000,
+      timeout: config.TIMEOUT_IPFS_PIN_MS,
+      signal,
     });
     return data.IpfsHash;
   },
 
-  async fetch(cid) {
+  async fetch(cid, signal) {
     const gateways = [config.IPFS_GATEWAY_URL, 'https://ipfs.io/ipfs'];
-    for (const gateway of gateways) {
-      const url = `${gateway.replace(/\/$/, '')}/${encodeURIComponent(cid)}`;
-      try {
-        // arraybuffer: we need the bytes, not a parsed-and-reserialised object.
-        const { data } = await axios.get<ArrayBuffer>(url, { responseType: 'arraybuffer', timeout: 15_000 });
-        return Buffer.from(data);
-      } catch {
-        logger.warn({ url }, 'IPFS gateway failed, trying next');
+    const handle = deadline('ipfs-fetch', signal);
+
+    try {
+      for (const gateway of gateways) {
+        if (handle.signal.aborted) break;
+        const url = `${gateway.replace(/\/$/, '')}/${encodeURIComponent(cid)}`;
+        const perGatewayBudget = Math.max(1000, Math.floor(handle.remaining() / gateways.length));
+        const gwHandle = deadline('ipfs-fetch', handle.signal, perGatewayBudget);
+
+        try {
+          // arraybuffer: we need the bytes, not a parsed-and-reserialised object.
+          const { data } = await axios.get<ArrayBuffer>(url, {
+            responseType: 'arraybuffer',
+            timeout: perGatewayBudget,
+            signal: gwHandle.signal,
+            maxContentLength: config.IPFS_MAX_BYTES,
+            maxBodyLength: config.IPFS_MAX_BYTES,
+          });
+          return Buffer.from(data);
+        } catch {
+          logger.warn({ url }, 'IPFS gateway failed, trying next');
+        } finally {
+          gwHandle.cleanup?.();
+        }
       }
+    } finally {
+      handle.cleanup?.();
     }
+
     throw new AppError(502, 'IPFS_RETRIEVAL_FAILED', 'Could not retrieve content from any IPFS gateway', { cid });
   },
 };
@@ -71,29 +92,62 @@ export interface PinnedDocument {
 }
 
 /** Canonicalises `document`, pins those bytes and returns their hash. Retries once. */
-export async function pinJson(document: unknown, name: string): Promise<PinnedDocument> {
+export async function pinJson(
+  document: unknown,
+  name: string,
+  opts?: { signal?: AbortSignal },
+): Promise<PinnedDocument> {
   const bytes = canonicalBytes(document);
   const hash = sha256Hex(bytes);
   let lastError: unknown;
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      const cid = await transport.pin(bytes, name);
-      logger.info({ name, cid, hash }, 'Pinned to IPFS');
-      return { cid, hash, bytes };
-    } catch (err) {
-      lastError = err;
-      if (err instanceof AppError && err.code === 'IPFS_NOT_CONFIGURED') break;
-      if (attempt === 1) {
-        logger.warn({ name }, 'IPFS pin failed, retrying in 3s');
-        await new Promise((r) => setTimeout(r, 3000));
+
+  const handle = deadline('ipfs-pin', opts?.signal);
+
+  try {
+    return await bulkheads['ipfs-pin'].run(async () => {
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        if (handle.signal.aborted) {
+          throw handle.signal.reason;
+        }
+
+        try {
+          const cid = await transport.pin(bytes, name, handle.signal);
+          logger.info({ name, cid, hash }, 'Pinned to IPFS');
+          return { cid, hash, bytes };
+        } catch (err) {
+          lastError = err;
+          if (opts?.signal?.aborted || handle.signal.aborted) {
+            throw (opts?.signal?.reason ?? handle.signal.reason);
+          }
+          if (err instanceof AppError && err.code === 'IPFS_NOT_CONFIGURED') break;
+          if (attempt === 1) {
+            logger.warn({ name }, 'IPFS pin failed, retrying in 3s');
+            await sleep(3000, handle.signal);
+          }
+        }
       }
-    }
+
+      if (lastError instanceof AppError) throw lastError;
+      logger.error({ err: lastError, name }, 'IPFS pin failed after retry');
+      throw new AppError(502, 'IPFS_UPLOAD_FAILED', 'Failed to pin document to IPFS', { name });
+    }, opts?.signal);
+  } finally {
+    handle.cleanup?.();
   }
-  if (lastError instanceof AppError) throw lastError;
-  logger.error({ err: lastError, name }, 'IPFS pin failed after retry');
-  throw new AppError(502, 'IPFS_UPLOAD_FAILED', 'Failed to pin document to IPFS', { name });
 }
 
-export function fetchIpfsBytes(cid: string): Promise<Buffer> {
-  return transport.fetch(cid);
+export function fetchIpfsBytes(cid: string, signal?: AbortSignal): Promise<Buffer> {
+  return bulkheads['ipfs-fetch'].run(async () => {
+    try {
+      return await transport.fetch(cid, signal);
+    } catch (err) {
+      if (err instanceof AppError && err.code === 'IPFS_RETRIEVAL_FAILED') {
+        throw err;
+      }
+      if (err instanceof TimeoutError || (err as any)?.code === 'UPSTREAM_TIMEOUT') {
+        throw new AppError(502, 'IPFS_RETRIEVAL_FAILED', 'Could not retrieve content from any IPFS gateway', { cid });
+      }
+      throw err;
+    }
+  }, signal);
 }

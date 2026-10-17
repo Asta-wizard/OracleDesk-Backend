@@ -94,6 +94,41 @@ const envSchema = z
     // ── Data sources ──────────────────────────────────────────────────────
     NEWSAPI_KEY: optionalString,
     FRED_API_KEY: optionalString,
+
+    // ── Resilience & Timeouts ─────────────────────────────────────────────
+    TIMEOUT_RPC_READ_MS: z.string().default('8000').transform(Number),
+    TIMEOUT_RPC_WRITE_MS: z.string().default('45000').transform(Number),
+    TIMEOUT_RPC_EVENTS_MS: z.string().default('15000').transform(Number),
+    TIMEOUT_LLM_MS: z.string().default('60000').transform(Number),
+    TIMEOUT_IPFS_PIN_MS: z.string().default('20000').transform(Number),
+    TIMEOUT_IPFS_FETCH_MS: z.string().default('15000').transform(Number),
+    TIMEOUT_DATASOURCE_MS: z.string().default('10000').transform(Number),
+
+    // Bulkheads (max concurrent)
+    BULKHEAD_LLM: z.string().default('2').transform(Number),
+    BULKHEAD_IPFS: z.string().default('4').transform(Number),
+    BULKHEAD_RPC_READ: z.string().default('16').transform(Number),
+    BULKHEAD_RPC_WRITE: z.string().default('4').transform(Number),
+    BULKHEAD_RPC_EVENTS: z.string().default('4').transform(Number),
+    BULKHEAD_DATASOURCE: z.string().default('8').transform(Number),
+    BULKHEAD_QUEUE: z.string().default('32').transform(Number),
+
+    // Request & cycle deadlines
+    HTTP_REQUEST_TIMEOUT_MS: z.string().default('30000').transform(Number),
+    CYCLE_DEADLINE_MS: z.string().default('600000').transform(Number),
+    IPFS_MAX_BYTES: z.string().default('2097152').transform(Number),
+
+    // ── Trace Audit (Issue #150) ──────────────────────────────────────────
+    TRACE_AUDIT_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
+    TRACE_AUDIT_CRON: z.string().default('40 */2 * * *'),
+    TRACE_AUDIT_RECHECK_HOURS: z.string().default('168').transform(Number),
+    TRACE_AUDIT_MAX_RPC: z.string().default('500').transform(Number),
+    TRACE_AUDIT_MAX_FETCHES: z.string().default('100').transform(Number),
+    TRACE_AUDIT_MAX_BYTES: z.string().default('2097152').transform(Number),
+
+    // ── Copy Trading (Issue #151) ─────────────────────────────────────────
+    COPY_TRADE_TTL_MINUTES: z.string().default('30').transform(Number),
+    COPY_TRADE_MAX_PENDING: z.string().default('5').transform(Number),
   })
   .superRefine((env, ctx) => {
     if (env.JWT_SECRET && env.JWT_SECRET.length < 32) {

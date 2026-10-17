@@ -31,8 +31,20 @@ export function contractErrorName(contract: keyof typeof TABLES, err: unknown, h
 }
 
 export class ChainError extends AppError {
-  constructor(message: string, public readonly contractError: string | null, details?: Record<string, unknown>) {
-    super(502, 'CHAIN_ERROR', message, { contractError, ...details });
+  constructor(
+    message: string,
+    public readonly contractError: string | null,
+    details?: Record<string, unknown>,
+    code = 'CHAIN_ERROR',
+  ) {
+    super(502, code, message, { contractError, ...details });
     this.name = 'ChainError';
+  }
+}
+
+export class ArchivedEntryError extends AppError {
+  constructor(message = 'Entry is archived on-chain', details?: Record<string, unknown>) {
+    super(410, 'ARCHIVED_ENTRY', message, details);
+    this.name = 'ArchivedEntryError';
   }
 }

@@ -58,6 +58,8 @@ export async function listTraces(req: Request, res: Response): Promise<void> {
         onChainTraceId:      true,
         publishTxHash:       true,
         previewSources:      true,
+        lastAuditStatus:     true,
+        lastAuditedAt:       true,
         createdAt:           true,
         market: { select: { question: true, category: true, settlementCurrency: true, onChainMarketId: true } },
       },
@@ -65,7 +67,12 @@ export async function listTraces(req: Request, res: Response): Promise<void> {
     prisma.reasoningTrace.count({ where }),
   ]);
 
-  sendSuccess(res, traces, 200, buildPaginationMeta(page, limit, total) as any);
+  const formattedTraces = traces.map((t) => ({
+    ...t,
+    audit: t.lastAuditStatus ? { status: t.lastAuditStatus, checkedAt: t.lastAuditedAt } : null,
+  }));
+
+  sendSuccess(res, formattedTraces, 200, buildPaginationMeta(page, limit, total) as any);
 }
 
 /**

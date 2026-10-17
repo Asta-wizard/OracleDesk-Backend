@@ -42,6 +42,18 @@ test('POST /markets/generate requires an admin', async () => {
   });
 });
 
+test('GET /admin/trace-audit requires an admin', async () => {
+  const { signToken } = await import('../src/middlewares/auth.middleware');
+  await withServer(async (base) => {
+    const anon = await fetch(`${base}/api/v1/admin/trace-audit`);
+    assert.equal(anon.status, 401);
+    const token = signToken('u1', Keypair.random().publicKey());
+    const nonAdmin = await fetch(`${base}/api/v1/admin/trace-audit`, { headers: { authorization: `Bearer ${token}` } });
+    assert.equal(nonAdmin.status, 403);
+    assert.equal((await nonAdmin.json()).error.code, 'FORBIDDEN');
+  });
+});
+
 test('CORS only allows configured origins', async () => {
   await withServer(async (base) => {
     const ok = await fetch(`${base}/health`, { headers: { origin: 'http://localhost:3000' } });
@@ -55,4 +67,15 @@ test('BigInt values serialise as decimal strings', async () => {
   const { default: app } = await import('../src/app');
   const replacer = app.get('json replacer');
   assert.equal(JSON.stringify({ id: 18446744073709551615n }, replacer), '{"id":"18446744073709551615"}');
+});
+
+test('PATCH /trade/copy/:id/confirm without auth is 401', async () => {
+  await withServer(async (base) => {
+    const res = await fetch(`${base}/api/v1/trade/copy/some-id/confirm`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ txHash: '11'.repeat(32) }),
+    });
+    assert.equal(res.status, 401);
+  });
 });
