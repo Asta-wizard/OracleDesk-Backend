@@ -53,6 +53,26 @@ When adding `CHECK` constraints or foreign keys to existing tables, follow the
 2. Run `scripts/audit-constraints.ts [--fix]` to detect and repair or quarantine any invalid rows.
 3. Validate the constraint in a subsequent migration using `ALTER TABLE ... VALIDATE CONSTRAINT ...` (takes `SHARE UPDATE EXCLUSIVE`, keeping tables available for reads and writes).
 
+### Migration lint
+
+CI (`migrations` job) runs `npm run lint:migrations` against the migrations a
+PR adds. Locally, run it after committing so it can diff against the base
+(`MIGRATIONS_BASE_REF=upstream/develop npm run lint:migrations`).
+
+- Editing, deleting or renaming a merged migration fails the lint.
+- Every new migration must start with `SET lock_timeout = '5s';` so a
+  migration blocked by a busy table fails fast instead of queuing queries.
+- New migrations are checked with a pinned [squawk](https://squawkhq.com/docs/)
+  (lock-heavy changes such as non-concurrent indexes, column type changes,
+  drops and renames are rejected).
+- To suppress a rule, add an entry to `prisma/migration-allowlist.json` scoped
+  to one migration, listing the rules, a `reason` and an `approvedBy` reviewer:
+  `{ "migration": "<dir name>", "rules": ["ban-drop-column"], "reason": "...", "approvedBy": "@reviewer" }`.
+- Enum values: add with `ALTER TYPE ... ADD VALUE` (the new value cannot be used
+  in the same transaction). Removing or renaming values needs expand/contract
+  (stop writing the value, migrate rows, recreate the type in a later release)
+  and an allowlist entry.
+
 ## Chain writes
 
 Anything that signs must go through `src/services/chain.service.ts`, which
