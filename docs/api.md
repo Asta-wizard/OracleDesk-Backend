@@ -551,9 +551,16 @@ The old payload had `amount` (float USDC), `price` (0–1) and `probChange`
 (string). Frontends derive display values from `collateralRaw` and
 `priceYesBps`.
 
+> A trace's `verified` flag means its `trace_hash` was confirmed on-chain: set
+> by the indexer when it sees the matching `TracePublished` event (or by
+> `POST /traces/verify`), never from a write result alone and never in dry-run.
+
 ### `REASONING_PUBLISHED`
 
 Emitted when the indexer stores a reasoning-registry publish event.
+`action` is one of the backend's `create_market`, `buy_yes`, `buy_no`
+(`src/lib/trace-actions.ts`); traces published by other agents may use other
+strings, such as `buy` from the contracts repo's TypeScript agents.
 
 ```json
 {
@@ -561,7 +568,7 @@ Emitted when the indexer stores a reasoning-registry publish event.
   "onChainMarketId": "0",
   "traceId": "uuid or null",
   "agent": "G…",
-  "action": "buy",
+  "action": "buy_yes",
   "ipfsCid": "bafy…",
   "traceHash": "64-hex",
   "txHash": "64-hex",

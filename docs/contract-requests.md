@@ -62,3 +62,10 @@ duplicate it, but today the adapter:
 If dry-run simulated (and returned the simulated result), the bindings were
 injectable, and `agentSell` existed, `src/services/chain.service.ts` here
 could become a thin wrapper around it. Its method names already match.
+
+## Note: `publish_trace` action strings differ between repos
+
+The backend publishes traces with `create_market`, `buy_yes` and `buy_no`
+(`src/lib/trace-actions.ts`). The contracts repo's TypeScript agents use
+`create_market` and `buy`. Consumers that group traces by action should treat
+`buy` as either direction, or the two sides should agree on one vocabulary.
