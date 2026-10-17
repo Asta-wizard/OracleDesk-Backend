@@ -6,6 +6,8 @@
   "scripts": {
     "build:test": "tsc -p tsconfig.test.json",
     "test": "npm run build:test && node --test --test-concurrency=1 dist-tests/tests/*.test.js",
+    "test:integration": "npm run build:test && node --test --test-concurrency=4 --test-global-setup=dist-tests/tests/integration/global-setup.js dist-tests/tests/integration/*.int.test.js",
+    "test:all": "npm test && npm run test:integration",
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
     "build": "tsc",
     "start": "npm run build && node dist/server.js",
@@ -50,6 +52,8 @@
     "zod": "~4.4.3"
   },
   "devDependencies": {
+    "@testcontainers/postgresql": "^12.2.1",
+    "@testcontainers/redis": "^12.2.1",
     "@types/bcrypt": "~6.0.0",
     "@types/compression": "~1.8.1",
     "@types/cors": "~2.8.19",
@@ -58,8 +62,11 @@
     "@types/jsonwebtoken": "~9.0.10",
     "@types/morgan": "~1.9.10",
     "@types/node": "~25.8.0",
+    "@types/pg": "^8.23.1",
     "@types/uuid": "~10.0.0",
     "nodemon": "~3.1.14",
+    "pg": "^8.23.1",
+    "testcontainers": "^12.2.1",
     "ts-node-dev": "~2.0.0",
     "typescript": "~6.0.3"
   }

@@ -121,3 +121,27 @@ in code, tests, fixtures or logs. Tests generate throwaway keys with
 `Keypair.random()`. New config goes in `.env.example` with an empty value. If you commit a secret by accident, tell a
 maintainer privately (see [SECURITY.md](SECURITY.md)) so it can be rotated;
 removing it in a later commit is not enough.
+
+## Tests
+
+There are two tiers:
+
+| Command | What runs | Needs |
+|---|---|---|
+| `npm test` | Unit tests (`tests/*.test.ts`), Prisma and Redis mocked | nothing |
+| `npm run test:integration` | `tests/integration/*.int.test.ts` against real Postgres 16 + Redis 7 | Docker, or `TEST_DATABASE_URL` + `TEST_REDIS_URL` |
+| `npm run test:all` | both | as above |
+
+Integration tests get services from Testcontainers locally, or from
+`TEST_DATABASE_URL` (an admin connection, used for `CREATE DATABASE`) and
+`TEST_REDIS_URL` when set, as in CI. A migrated template database is created
+once; each test file gets its own clone, and tests truncate all tables in
+`beforeEach`. Without Docker or the `TEST_*` URLs, the tier skips with a message.
+
+Writing an integration test:
+
+- Call `await integrationEnv('<label>')` in an async `before()` hook, **then**
+  dynamically import `src` modules (`config` and `prisma` read env at import).
+- Seed data with the factories in `tests/helpers/factories.ts`.
+- Use `withRedisPrefix()` from `tests/helpers/redis.ts` so parallel files don't
+  share Redis keys.
