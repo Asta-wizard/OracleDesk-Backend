@@ -1,13 +1,14 @@
 import cron from 'node-cron';
 import { runMarketMakerCycle } from '../agents/market-maker.agent';
 import { logger } from '../lib/logger';
+import { newId, runWithContext } from '../lib/context';
 
-let isRunning = false;
+let runningCycleId: string | null = null;
 
 /**
  * Schedules the Market Maker Agent to run every 15 minutes.
  *
- * The `isRunning` guard prevents overlapping executions.
+ * The `runningCycleId` guard prevents overlapping executions.
  * If a cycle is still running when the next one is scheduled,
  * the new trigger is skipped.
  *
@@ -15,20 +16,24 @@ let isRunning = false;
  *   Runs at :00, :15, :30, :45 of every hour
  */
 export function startIngestionCron(): void {
-  cron.schedule('0,15,30,45 * * * *', async () => {
-    if (isRunning) {
-      logger.warn('Ingestion cron: previous cycle still running — skipping');
-      return;
-    }
+  // The context is entered inside the callback: node-cron fires it from its own timer.
+  cron.schedule('0,15,30,45 * * * *', () => {
+    const cycleId = newId('cyc');
+    return runWithContext({ requestId: cycleId, cycleId, kind: 'cron', job: 'market_maker' }, async () => {
+      if (runningCycleId) {
+        logger.warn({ skippedJob: 'market_maker', runningCycleId }, 'Ingestion cron: previous cycle still running — skipping');
+        return;
+      }
 
-    isRunning = true;
-    try {
-      await runMarketMakerCycle();
-    } catch (err) {
-      logger.error({ err }, 'Ingestion cron: cycle failed');
-    } finally {
-      isRunning = false;
-    }
+      runningCycleId = cycleId;
+      try {
+        await runMarketMakerCycle();
+      } catch (err) {
+        logger.error({ err }, 'Ingestion cron: cycle failed');
+      } finally {
+        runningCycleId = null;
+      }
+    });
   });
 
   logger.info('Ingestion cron started (every 15 minutes)');

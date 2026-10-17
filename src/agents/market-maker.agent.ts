@@ -8,7 +8,7 @@ import { generateReasoningTrace } from '../services/reasoning.service';
 import { createMarketOnChain } from '../services/market-chain.service';
 import { enqueueTracePublication } from '../services/trace-publish.service';
 import { TRACE_ACTIONS } from '../lib/trace-actions';
-import { prisma } from '../lib/prisma';
+import { writeAgentLog } from '../lib/agent-log';
 import { logger } from '../lib/logger';
 import { config } from '../config';
 import { deadline } from '../lib/resilience';
@@ -135,13 +135,11 @@ export async function runMarketMakerCycle(opts?: { signal?: AbortSignal }): Prom
   } catch (err) {
     logger.error({ err }, 'Market Maker Agent: unhandled cycle error');
 
-    await prisma.agentLog.create({
-      data: {
-        agentType: 'MARKET_MAKER',
-        level:     'ERROR',
-        action:    'CYCLE_FAILED',
-        error:     String(err),
-      },
+    await writeAgentLog({
+      agentType: 'MARKET_MAKER',
+      level:     'ERROR',
+      action:    'CYCLE_FAILED',
+      error:     String(err),
     }).catch(() => {});
 
     throw err; // Re-throw so the job tracker records FAILED status

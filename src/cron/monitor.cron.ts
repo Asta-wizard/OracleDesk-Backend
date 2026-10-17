@@ -2,9 +2,16 @@ import cron from 'node-cron';
 import { runTraderCycle } from '../agents/trader.agent';
 import { expireStaleSubscriptions } from '../services/subscription.service';
 import { logger } from '../lib/logger';
+import { newId, runWithContext } from '../lib/context';
 import { purgeExpiredIdempotencyKeys } from '../middlewares/idempotency.middleware';
 
-let traderRunning = false;
+let runningTraderCycleId: string | null = null;
+
+/** One correlated context per cron tick. */
+function tick(job: string, fn: () => Promise<void>): Promise<void> {
+  const cycleId = newId('cyc');
+  return runWithContext({ requestId: cycleId, cycleId, kind: 'cron', job }, fn);
+}
 
 /**
  * Position Monitor Cron — runs every 15 minutes.
@@ -17,45 +24,43 @@ let traderRunning = false;
  */
 export function startMonitorCron(): void {
   // Trader Agent — every 15 minutes
-  cron.schedule('5,20,35,50 * * * *', async () => {
-    if (traderRunning) {
-      logger.warn('Monitor cron: trader cycle still running — skipping');
+  cron.schedule('5,20,35,50 * * * *', () => tick('trader', async () => {
+    if (runningTraderCycleId) {
+      logger.warn({ skippedJob: 'trader', runningCycleId: runningTraderCycleId }, 'Monitor cron: trader cycle still running — skipping');
       return;
     }
 
-    traderRunning = true;
+    runningTraderCycleId = newId('cyc');
     try {
       await runTraderCycle();
     } catch (err) {
       logger.error({ err }, 'Monitor cron: trader cycle failed');
     } finally {
-      traderRunning = false;
+      runningTraderCycleId = null;
     }
-  });
+  }));
 
   // Subscription expiry — every hour
-  cron.schedule('0 * * * *', async () => {
+  cron.schedule('0 * * * *', () => tick('subscription_expiry', async () => {
     try {
       await expireStaleSubscriptions();
     } catch (err) {
       logger.error({ err }, 'Monitor cron: subscription expiry failed');
     }
-  });
+  }));
 
   // Expired Idempotency-Key rows (24h TTL, #123) — hourly at :10, in batches of 5 000
-  cron.schedule('10 * * * *', async () => {
+  cron.schedule('10 * * * *', () => tick('idempotency_purge', async () => {
     try {
       const deleted = await purgeExpiredIdempotencyKeys();
       if (deleted > 0) logger.info({ deleted }, 'Monitor cron: purged expired idempotency keys');
     } catch (err) {
       logger.error({ err }, 'Monitor cron: idempotency key purge failed');
     }
-  });
+  }));
 
   // Copy trade sweep — every 5 minutes
-  cron.schedule('*/5 * * * *', async () => {
-    await sweepCopyTrades();
-  });
+  cron.schedule('*/5 * * * *', () => tick('copy_trade_sweep', sweepCopyTrades));
 
   logger.info('Monitor cron started');
 }

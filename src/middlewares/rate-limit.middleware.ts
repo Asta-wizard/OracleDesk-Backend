@@ -1,7 +1,11 @@
 import rateLimit from 'express-rate-limit';
 import { config } from '../config';
 
-const body = { ok: false, data: null, error: { code: 'RATE_LIMITED', message: 'Too many requests. Try again shortly.' } };
+const body = (requestId?: string) => ({
+  ok: false,
+  data: null,
+  error: { code: 'RATE_LIMITED', message: 'Too many requests. Try again shortly.', requestId },
+});
 
 const limiter = (windowMs: number, limit: number) =>
   rateLimit({
@@ -9,7 +13,10 @@ const limiter = (windowMs: number, limit: number) =>
     limit,
     standardHeaders: true,
     legacyHeaders: false,
-    message: body,
+    message: (_req: unknown, res: { getHeader(name: string): unknown }) => {
+      const id = res.getHeader('X-Request-Id');
+      return body(typeof id === 'string' ? id : undefined);
+    },
     skip: () => config.NODE_ENV === 'test',
   });
 

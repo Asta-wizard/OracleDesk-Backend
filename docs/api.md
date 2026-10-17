@@ -14,8 +14,10 @@ Every response, success or error:
 
 ```json
 { "ok": true,  "data": { }, "error": null, "meta": { } }
-{ "ok": false, "data": null, "error": { "code": "SOME_CODE", "message": "Readable text", "details": { } } }
+{ "ok": false, "data": null, "error": { "code": "SOME_CODE", "message": "Readable text", "details": { }, "requestId": "req_018f..." } }
 ```
+
+Every response carries an `X-Request-Id` header (exposed via CORS), and error envelopes repeat it as `error.requestId`; quote it when reporting a problem. A client may send its own `X-Request-Id` (8 to 64 characters of `A-Z a-z 0-9 . _ : -`); any other value is ignored and a new id is generated.
 
 `meta` is optional. List endpoints put pagination there:
 `{ "page": 1, "limit": 20, "total": 57, "totalPages": 3 }`.

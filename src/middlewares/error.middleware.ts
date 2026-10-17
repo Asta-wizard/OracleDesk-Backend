@@ -1,6 +1,7 @@
 import type { Request, Response, NextFunction } from 'express';
 import { Prisma } from '@prisma/client';
 import { logger } from '../lib/logger';
+import { currentContext } from '../lib/context';
 import { sendError } from '../utils/response.util';
 
 export class AppError extends Error {
@@ -39,7 +40,7 @@ export function errorMiddleware(
   // AppError instances
   if (err instanceof AppError) {
     logger.warn(
-      { code: err.code, path: req.path, details: err.details },
+      { code: err.code, path: req.path, details: err.details, requestId: currentContext()?.requestId },
       err.message,
     );
     sendError(res, err.statusCode, err.code, err.message, err.details);
@@ -74,6 +75,7 @@ export function errorMiddleware(
   }
 
   // Unexpected errors — log the full stack
-  logger.error({ err, path: req.path, method: req.method }, 'Unhandled error');
-  sendError(res, 500, 'INTERNAL_ERROR', 'An unexpected error occurred');
+  const requestId = currentContext()?.requestId ?? res.getHeader('X-Request-Id');
+  logger.error({ err, path: req.path, method: req.method, requestId }, 'Unhandled error');
+  sendError(res, 500, 'INTERNAL_ERROR', `An unexpected error occurred${requestId ? ` (reference: ${requestId})` : ''}`);
 }

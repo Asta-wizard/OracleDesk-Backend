@@ -18,6 +18,7 @@ import { config } from '../config';
 import { CONTRACTS } from '../config/contracts';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
+import { newId, runWithContext } from '../lib/context';
 import { readClients, rpcServer } from './stellar/clients';
 import { printable } from './chain.service';
 import { priceYesBps } from '../generated/fpmm';
@@ -328,13 +329,16 @@ export function startEventListener(emit: IndexerDeps['emit']): () => void {
   }
   let stopped = false;
   let timer: NodeJS.Timeout | null = null;
-  const tick = async () => {
-    try {
-      await backfillEvents(undefined, { source: rpcServer, emit });
-    } catch (err) {
-      logger.warn({ err: err instanceof Error ? err.message : err }, 'Indexer poll failed; will retry');
-    }
-    if (!stopped) timer = setTimeout(tick, config.INDEXER_POLL_MS);
+  const tick = (): Promise<void> => {
+    const cycleId = newId('cyc');
+    return runWithContext({ requestId: cycleId, cycleId, kind: 'indexer' }, async () => {
+      try {
+        await backfillEvents(undefined, { source: rpcServer, emit });
+      } catch (err) {
+        logger.warn({ err: err instanceof Error ? err.message : err }, 'Indexer poll failed; will retry');
+      }
+      if (!stopped) timer = setTimeout(tick, config.INDEXER_POLL_MS);
+    });
   };
   void tick();
   logger.info({ pollMs: config.INDEXER_POLL_MS }, 'Stellar event indexer started');
