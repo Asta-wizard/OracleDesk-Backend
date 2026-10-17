@@ -90,6 +90,8 @@ The full contract with the frontend, including request and response shapes, erro
 | `npm run dev` | Dev server with reload |
 | `npm run build` / `npm start` | Compile to `dist/` / build and run |
 | `npm test` | Compile and run `tests/*.test.ts` with `node:test` |
+| `npm run test:integration` | Integration tests against real Postgres + Redis (Docker or `TEST_DATABASE_URL`/`TEST_REDIS_URL`; see CONTRIBUTING.md) |
+| `npm run test:all` | Unit then integration tests |
 | `npm run sync:contracts` | Copy generated contract code from `contracts/` into `src/generated/` |
 | `npm run check:contracts` | Fail if `src/generated/` is stale (CI runs this) |
 | `npm run prisma:migrate` | `prisma migrate dev` |

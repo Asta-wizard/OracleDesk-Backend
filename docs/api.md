@@ -72,6 +72,57 @@ removes the enum value. `settlementCurrency` stays in responses (always
 `"USDC"`) so the frontend doesn't break; the `currency` filter on
 `GET /markets` accepts only `USDC`.
 
+## Idempotency
+
+State-changing endpoints accept an `Idempotency-Key` header
+([draft-ietf-httpapi-idempotency-key-header](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/),
+the same model as Stripe). Generate one key per **logical operation** and send
+the same key on every retry of it.
+
+| Route | Header |
+|---|---|
+| `POST /markets/generate` | **required** |
+| `POST /trade/copy` | **required** |
+| `PATCH /trade/copy/:id/confirm` | optional |
+| `PUT /traces/access/allowance` | optional |
+| `POST /traces/verify` | optional |
+| `POST /traces/:id/unlock` | optional |
+| `POST /auth/challenge`, `POST /auth/verify` | not supported (the handshake is single-use, and `/auth/verify` returns a JWT that is never stored) |
+
+- **Format:** 1–255 printable ASCII characters. A UUID (`crypto.randomUUID()`) is recommended.
+- **Scope:** `(user, method, route template, key)`. The same key from another user or on another route never collides.
+- **TTL:** 24 h. Expired keys are purged hourly.
+- **Fingerprint:** sha256 of the canonical `{ method, route, params, query, body }` (keys sorted, so JSON key order and query-parameter order don't matter).
+
+**Responses**
+
+| Situation | Result |
+|---|---|
+| First request | Runs normally. Its 2xx/4xx response is stored. |
+| Exact retry after it finished | The stored status and body are replayed with `Idempotent-Replayed: true`. The handler does **not** run again (e.g. `POST /markets/generate` returns the original `jobId` and starts no new cycle). |
+| Retry while the first is still running | `409 IDEMPOTENCY_IN_PROGRESS` with `Retry-After: 1` |
+| Same key, different request | `422 IDEMPOTENCY_KEY_MISMATCH` |
+| Missing key on a required route | `400 IDEMPOTENCY_KEY_REQUIRED` |
+| Malformed key | `400 IDEMPOTENCY_KEY_INVALID` |
+| Original response was > 64 KB | `409 IDEMPOTENCY_RESPONSE_UNAVAILABLE` (use a new key) |
+
+- **5xx responses are not stored.** The key is released so a retry runs again. If a handler commits a side effect and *then* fails with a 5xx, a retry re-executes it, so such handlers must make the effect itself idempotent (as `recordPayment` does for a duplicate `txHash`).
+- A stored **4xx is replayed as-is**, even if state has changed since (e.g. a `403 TRACE_LOCKED` replays after the user buys a pass). After changing state, use a **new** key.
+- A request that crashed mid-flight holds its key for 60 s, after which a retry takes it over.
+- Only `Content-Type`, `Location` and `API-Version` are replayed. `Set-Cookie`/`Authorization` are never stored, and body fields named like `token`/`secret`/`authorization` are redacted before storage.
+
+**Frontend:** create the key when the user starts the action, and reuse it across React Query retries:
+
+```ts
+const key = crypto.randomUUID();             // once per logical action, e.g. per click
+useMutation({
+  mutationKey: ['copy-trade', key],
+  mutationFn: (vars) =>
+    api.post('/trade/copy', vars, { headers: { 'Idempotency-Key': key } }),
+  retry: 3,                                  // retries reuse the same key
+});
+```
+
 ## Endpoints
 
 ### Health

@@ -584,4 +584,28 @@ model TracePublication {
 
   @@index([status, nextAttemptAt])
   @@map("trace_publications")
+/// Idempotency-Key records for state-changing endpoints (#123). One row per
+/// (scope, method, route, key); see src/middlewares/idempotency.middleware.ts.
+model IdempotencyKey {
+  id              String   @id @default(uuid())
+  /// userId, or "anon" for unauthenticated routes
+  scope           String
+  method          String
+  /// Route template, e.g. "/api/v1/trade/copy"
+  route           String
+  key             String
+  /// sha256 of the canonical request (method, route, params, query, body)
+  fingerprint     String
+  /// IN_PROGRESS | COMPLETED
+  status          String
+  lockedUntil     DateTime
+  responseCode    Int?
+  responseBody    Json?
+  responseHeaders Json?
+  createdAt       DateTime @default(now())
+  expiresAt       DateTime
+
+  @@unique([scope, method, route, key])
+  @@index([expiresAt])
+  @@map("idempotency_keys")
 }

@@ -1,6 +1,7 @@
 export function setupTestEnv(): void {
   process.env.NODE_ENV = 'test';
   process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgresql://test:test@localhost:5432/test';
+  process.env.REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
   process.env.JWT_SECRET = process.env.JWT_SECRET || '01234567890123456789012345678901';
   // Throwaway key generated for tests only; never funded, never used on-chain.
   process.env.AUTH_SIGNING_SECRET = '';
