@@ -316,6 +316,7 @@ model ReasoningTrace {
   subscriptions Subscription[]
   paymentEvents PaymentEvent[]
   audits        TraceAudit[]
+  publication   TracePublication?
 
   @@index([marketId])
   @@index([ipfsCid])
@@ -547,4 +548,64 @@ model ConstraintQuarantine {
 
   @@index([tableName, checkName])
   @@map("constraint_quarantine")
+}
+
+/// Lifecycle of a reasoning trace's on-chain publication (#131).
+enum TracePublicationStatus {
+  AWAITING_PIN
+  AWAITING_MARKET
+  READY
+  SUBMITTED
+  CONFIRMED
+  FAILED
+}
+
+/// Durable queue row: one per trace that should be published to
+/// reasoning-registry. Processed by src/jobs/trace-publication.worker.ts.
+model TracePublication {
+  id               String                 @id @default(uuid())
+  traceId          String                 @unique
+  action           String
+  /// Exact trace document; pinned bytes = canonicalBytes(payload). Null only
+  /// for backfilled rows whose trace was already pinned.
+  payload          Json?
+  status           TracePublicationStatus @default(AWAITING_PIN)
+  attempts         Int                    @default(0)
+  lastError        String?
+  nextAttemptAt    DateTime               @default(now())
+  submittedTxHash  String?
+  /// Trace id returned by the publish_trace write, used to re-check chain state.
+  submittedTraceId BigInt?
+  confirmedAt      DateTime?
+  createdAt        DateTime               @default(now())
+  updatedAt        DateTime               @updatedAt
+
+  trace ReasoningTrace @relation(fields: [traceId], references: [id], onDelete: Cascade)
+
+  @@index([status, nextAttemptAt])
+  @@map("trace_publications")
+/// Idempotency-Key records for state-changing endpoints (#123). One row per
+/// (scope, method, route, key); see src/middlewares/idempotency.middleware.ts.
+model IdempotencyKey {
+  id              String   @id @default(uuid())
+  /// userId, or "anon" for unauthenticated routes
+  scope           String
+  method          String
+  /// Route template, e.g. "/api/v1/trade/copy"
+  route           String
+  key             String
+  /// sha256 of the canonical request (method, route, params, query, body)
+  fingerprint     String
+  /// IN_PROGRESS | COMPLETED
+  status          String
+  lockedUntil     DateTime
+  responseCode    Int?
+  responseBody    Json?
+  responseHeaders Json?
+  createdAt       DateTime @default(now())
+  expiresAt       DateTime
+
+  @@unique([scope, method, route, key])
+  @@index([expiresAt])
+  @@map("idempotency_keys")
 }

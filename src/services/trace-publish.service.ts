@@ -1,52 +1,47 @@
 /**
- * Reasoning trace lifecycle after generation:
- *   pin the canonical JSON → traceHash = sha256(pinned bytes) →
- *   reasoning_registry.publish_trace (dry-run simulates) → verify.
+ * Reasoning trace lifecycle after generation (#131):
+ *   enqueue → pin the canonical JSON (traceHash = sha256(pinned bytes)) →
+ *   wait for the market's on-chain id → reasoning_registry.publish_trace →
+ *   confirmed by the indexer's TracePublished event → verified.
+ * See src/jobs/trace-publication.worker.ts.
  */
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
 import { AppError } from '../middlewares/error.middleware';
 import { verifyTraceHash, sha256Hex } from '../utils/hash.util';
-import { fetchIpfsBytes, pinJson } from './ipfs.service';
-import { getOnChainTrace, publishTrace } from './chain.service';
-import { agentSigner } from './stellar/clients';
+import { Prisma } from '@prisma/client';
+import { fetchIpfsBytes } from './ipfs.service';
+import { getOnChainTrace, printable } from './chain.service';
+import { processPublication } from '../jobs/trace-publication.worker';
+import type { TraceAction } from '../lib/trace-actions';
 import type { TraceVerification } from '../types';
 
-export async function pinAndPublishTrace(params: {
-  traceId: string;
-  payload: Record<string, unknown>;
-  action: string;
-  onChainMarketId: bigint | null;
-}): Promise<{ cid: string; traceHash: string; onChainTraceId: bigint | null; publishTxHash: string | null }> {
-  const pinned = await pinJson(params.payload, `oracledesk-trace-${params.traceId}`);
-
-  await prisma.reasoningTrace.update({
-    where: { id: params.traceId },
-    data: { ipfsCid: pinned.cid, traceHash: pinned.hash },
+/**
+ * Records that a trace must be published (#131). The row is durable: if
+ * pinning, the market's on-chain creation, or the publish call isn't possible
+ * yet, src/jobs/trace-publication.worker.ts finishes it later. An immediate
+ * best-effort pass runs in the background so the common case stays fast.
+ */
+export async function enqueueTracePublication(
+  params: { traceId: string; payload: Record<string, unknown>; action: TraceAction },
+  deps: { prisma?: any; processNow?: boolean } = {},
+): Promise<{ id: string }> {
+  const db = deps.prisma ?? prisma;
+  const row = await db.tracePublication.upsert({
+    where: { traceId: params.traceId },
+    create: {
+      traceId: params.traceId,
+      action: params.action,
+      payload: printable(params.payload) as Prisma.InputJsonValue,
+    },
+    update: {},
   });
-
-  if (params.onChainMarketId === null) {
-    logger.info({ traceId: params.traceId }, 'Trace pinned; market not on-chain yet, so not published');
-    return { cid: pinned.cid, traceHash: pinned.hash, onChainTraceId: null, publishTxHash: null };
+  if (deps.processNow ?? true) {
+    void processPublication(row, { prisma: db }).catch((err) =>
+      logger.warn({ err, traceId: params.traceId }, 'Immediate trace publication pass failed; the worker will retry'),
+    );
   }
-
-  const result = await publishTrace({
-    agent: agentSigner().publicKey as string,
-    market_id: params.onChainMarketId,
-    action: params.action,
-    trace_hash: Buffer.from(pinned.hash, 'hex'),
-    ipfs_cid: pinned.cid,
-  });
-
-  if (result.mode === 'dry-run') {
-    return { cid: pinned.cid, traceHash: pinned.hash, onChainTraceId: null, publishTxHash: null };
-  }
-
-  await prisma.reasoningTrace.update({
-    where: { id: params.traceId },
-    data: { onChainTraceId: result.value, publishTxHash: result.txHash },
-  });
-  return { cid: pinned.cid, traceHash: pinned.hash, onChainTraceId: result.value, publishTxHash: result.txHash };
+  return { id: row.id };
 }
 
 /**
