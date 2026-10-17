@@ -7,6 +7,7 @@ import { prisma } from './lib/prisma';
 import { startIngestionCron } from './cron/ingestion.cron';
 import { startMonitorCron } from './cron/monitor.cron';
 import { startTraceAuditCron } from './cron/trace-audit.cron';
+import { startTracePublicationCron } from './cron/trace-publication.cron';
 import { startEventListener } from './services/indexer.service';
 import { closeRedis } from './lib/redis';
 
@@ -46,6 +47,7 @@ async function bootstrap(): Promise<void> {
   startIngestionCron();
   startMonitorCron();
   startTraceAuditCron();
+  startTracePublicationCron();
 
   io.on('connection', (socket) => {
     logger.info({ socketId: socket.id }, 'New client connected to socket.io');

@@ -126,6 +126,20 @@ const envSchema = z
     TRACE_AUDIT_MAX_FETCHES: z.string().default('100').transform(Number),
     TRACE_AUDIT_MAX_BYTES: z.string().default('2097152').transform(Number),
 
+    // ── Trace publication queue (Issue #131) ──────────────────────────────
+    TRACE_PUBLISH_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
+    TRACE_PUBLISH_CRON: z.string().default('*/30 * * * * *'),
+    TRACE_PUBLISH_MAX_ATTEMPTS: z
+      .string()
+      .default('8')
+      .transform(Number)
+      .refine((n) => Number.isInteger(n) && n >= 1 && n <= 100, 'must be an integer between 1 and 100'),
+    TRACE_CONFIRM_TIMEOUT_MS: z
+      .string()
+      .default('600000')
+      .transform(Number)
+      .refine((n) => Number.isInteger(n) && n >= 10_000, 'must be an integer >= 10000'),
+
     // ── Copy Trading (Issue #151) ─────────────────────────────────────────
     COPY_TRADE_TTL_MINUTES: z.string().default('30').transform(Number),
     COPY_TRADE_MAX_PENDING: z.string().default('5').transform(Number),
