@@ -171,10 +171,20 @@ async function applySideEffects(event: DecodedEvent, emit: IndexerDeps['emit']):
       },
       select: { id: true, onChainTraceId: true },
     });
-    if (trace && trace.onChainTraceId === null) {
-      await prisma.reasoningTrace.update({
-        where: { id: trace.id },
-        data: { onChainTraceId, publishTxHash: event.txHash },
+    if (trace && (trace.onChainTraceId === null || trace.onChainTraceId === onChainTraceId)) {
+      // The event's trace_hash equals our stored traceHash, which is exactly
+      // what verification means for our own traces (#131).
+      if (trace.onChainTraceId === null) {
+        await prisma.reasoningTrace.update({
+          where: { id: trace.id },
+          data: { onChainTraceId, publishTxHash: event.txHash, verified: true },
+        });
+      } else {
+        await prisma.reasoningTrace.update({ where: { id: trace.id }, data: { verified: true } });
+      }
+      await prisma.tracePublication.updateMany({
+        where: { traceId: trace.id, status: { in: ['AWAITING_MARKET', 'READY', 'SUBMITTED'] } },
+        data: { status: 'CONFIRMED', confirmedAt: new Date(), lastError: null },
       });
     }
     emit('REASONING_PUBLISHED', {

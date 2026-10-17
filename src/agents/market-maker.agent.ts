@@ -6,7 +6,8 @@ import {
 } from '../services/market.service';
 import { generateReasoningTrace } from '../services/reasoning.service';
 import { createMarketOnChain } from '../services/market-chain.service';
-import { pinAndPublishTrace } from '../services/trace-publish.service';
+import { enqueueTracePublication } from '../services/trace-publish.service';
+import { TRACE_ACTIONS } from '../lib/trace-actions';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
 import { config } from '../config';
@@ -110,16 +111,17 @@ export async function runMarketMakerCycle(opts?: { signal?: AbortSignal }): Prom
 
     signal.throwIfAborted();
 
-    // Step 7: Pin the trace and publish its hash to reasoning-registry
+    // Step 7: Queue the trace for pinning + publication to reasoning-registry.
+    // The queue publishes it once the market is on-chain (#131). The payload is
+    // fixed now: re-pinning later with a new onChainMarketId would change traceHash.
     try {
-      await pinAndPublishTrace({
+      await enqueueTracePublication({
         traceId: trace.id,
         payload: { ...tracePayload, onChainMarketId: onChainMarketId?.toString() ?? null },
-        action: 'create_market',
-        onChainMarketId,
+        action: TRACE_ACTIONS.createMarket,
       });
     } catch (err) {
-      logger.error({ err, traceId: trace.id }, 'Market Maker Agent: trace pin/publish failed');
+      logger.error({ err, traceId: trace.id }, 'Market Maker Agent: failed to queue trace publication');
     }
 
     logger.info({ marketId: market.id, traceId: trace.id }, 'Market Maker Agent: cycle complete');

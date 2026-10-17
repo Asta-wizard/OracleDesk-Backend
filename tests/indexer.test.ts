@@ -30,6 +30,7 @@ async function setup(events = FIXTURES.map(toEventResponse)) {
       ['m0', { id: 'm0', onChainMarketId: 0n, question: 'Market zero?', status: 'ACTIVE' }],
     ]),
     traces: [{ id: 't0', marketId: 'm0', market: { onChainMarketId: 0n }, traceHash: 'f4b58d4ac4068163f34bd9486f0563c70873afa5f64e915ab7e85af7dee15e4e', onChainTraceId: null as bigint | null }],
+    publicationUpdates: [] as Array<{ where: any; data: any }>,
     copyTrades: [] as any[],
     closedPositions: 0,
   };
@@ -55,6 +56,10 @@ async function setup(events = FIXTURES.map(toEventResponse)) {
     }) ?? null;
   };
   (prisma.reasoningTrace.update as any) = async ({ where, data }: any) => Object.assign(db.traces.find((t) => t.id === where.id)!, data);
+  (prisma.tracePublication.updateMany as any) = async ({ where, data }: any) => {
+    db.publicationUpdates.push({ where, data });
+    return { count: 1 };
+  };
   (prisma.copyTrade.findFirst as any) = async ({ where }: any) => {
     return db.copyTrades.find((ct) => {
       if (where.txHash && ct.txHash !== where.txHash) return false;
@@ -113,6 +118,11 @@ test('indexes trades, resolutions and traces from recorded events', async () => 
   assert.equal(published.onChainTraceId, '0');
   assert.equal(published.traceId, 't0');
   assert.equal(db.traces[0].onChainTraceId, 0n);
+  // #131: indexer confirmation verifies the trace and confirms its queue row.
+  assert.equal((db.traces[0] as any).verified, true);
+  assert.equal(db.publicationUpdates.length, 1);
+  assert.equal(db.publicationUpdates[0].where.traceId, 't0');
+  assert.equal(db.publicationUpdates[0].data.status, 'CONFIRMED');
 });
 
 test('re-reading the same ledgers is idempotent', async () => {
