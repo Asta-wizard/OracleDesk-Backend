@@ -2,6 +2,7 @@ import cron from 'node-cron';
 import { runTraderCycle } from '../agents/trader.agent';
 import { expireStaleSubscriptions } from '../services/subscription.service';
 import { logger } from '../lib/logger';
+import { purgeExpiredIdempotencyKeys } from '../middlewares/idempotency.middleware';
 
 let traderRunning = false;
 
@@ -38,6 +39,16 @@ export function startMonitorCron(): void {
       await expireStaleSubscriptions();
     } catch (err) {
       logger.error({ err }, 'Monitor cron: subscription expiry failed');
+    }
+  });
+
+  // Expired Idempotency-Key rows (24h TTL, #123) — hourly at :10, in batches of 5 000
+  cron.schedule('10 * * * *', async () => {
+    try {
+      const deleted = await purgeExpiredIdempotencyKeys();
+      if (deleted > 0) logger.info({ deleted }, 'Monitor cron: purged expired idempotency keys');
+    } catch (err) {
+      logger.error({ err }, 'Monitor cron: idempotency key purge failed');
     }
   });
 

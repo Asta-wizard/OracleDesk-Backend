@@ -9,6 +9,7 @@ import {
 } from '../controllers/market.controller';
 import { requireAdmin, requireAuth } from '../middlewares/auth.middleware';
 import { generateLimiter } from '../middlewares/rate-limit.middleware';
+import { idempotent } from '../middlewares/idempotency.middleware';
 
 const router = Router();
 
@@ -18,7 +19,9 @@ router.get('/on-chain/:onChainMarketId', getMarketByOnChainId);
 router.get('/on-chain/:onChainMarketId/state', getOnChainMarketState);
 
 // Admin only: each run calls paid LLM APIs and the treasury.
-router.post('/generate', generateLimiter, requireAuth, requireAdmin, triggerMarketGeneration);
+// Idempotency-Key required (#123): a retry replays the stored 202 and its
+// jobId instead of starting a second paid market-maker cycle.
+router.post('/generate', generateLimiter, requireAuth, requireAdmin, idempotent({ required: true }), triggerMarketGeneration);
 router.get('/generation-status/:jobId', requireAuth, getMarketGenerationStatus);
 
 router.get('/:id', getMarket);
