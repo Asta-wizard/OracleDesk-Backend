@@ -1,6 +1,7 @@
 import cron from 'node-cron';
 import { runMarketMakerCycle } from '../agents/market-maker.agent';
 import { logger } from '../lib/logger';
+import { recordCronRun } from './registry';
 
 let isRunning = false;
 
@@ -22,9 +23,12 @@ export function startIngestionCron(): void {
     }
 
     isRunning = true;
+    const startedAt = new Date();
     try {
       await runMarketMakerCycle();
+      recordCronRun('ingestion', 'success', startedAt, new Date());
     } catch (err) {
+      recordCronRun('ingestion', 'failure', startedAt, new Date(), err);
       logger.error({ err }, 'Ingestion cron: cycle failed');
     } finally {
       isRunning = false;

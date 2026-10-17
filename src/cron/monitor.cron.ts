@@ -3,6 +3,7 @@ import { runTraderCycle } from '../agents/trader.agent';
 import { expireStaleSubscriptions } from '../services/subscription.service';
 import { logger } from '../lib/logger';
 import { purgeExpiredIdempotencyKeys } from '../middlewares/idempotency.middleware';
+import { recordCronRun } from './registry';
 
 let traderRunning = false;
 
@@ -24,9 +25,12 @@ export function startMonitorCron(): void {
     }
 
     traderRunning = true;
+    const startedAt = new Date();
     try {
       await runTraderCycle();
+      recordCronRun('trader', 'success', startedAt, new Date());
     } catch (err) {
+      recordCronRun('trader', 'failure', startedAt, new Date(), err);
       logger.error({ err }, 'Monitor cron: trader cycle failed');
     } finally {
       traderRunning = false;
@@ -35,19 +39,25 @@ export function startMonitorCron(): void {
 
   // Subscription expiry — every hour
   cron.schedule('0 * * * *', async () => {
+    const startedAt = new Date();
     try {
       await expireStaleSubscriptions();
+      recordCronRun('subscription-expiry', 'success', startedAt, new Date());
     } catch (err) {
+      recordCronRun('subscription-expiry', 'failure', startedAt, new Date(), err);
       logger.error({ err }, 'Monitor cron: subscription expiry failed');
     }
   });
 
   // Expired Idempotency-Key rows (24h TTL, #123) — hourly at :10, in batches of 5 000
   cron.schedule('10 * * * *', async () => {
+    const startedAt = new Date();
     try {
       const deleted = await purgeExpiredIdempotencyKeys();
+      recordCronRun('idempotency-purge', 'success', startedAt, new Date());
       if (deleted > 0) logger.info({ deleted }, 'Monitor cron: purged expired idempotency keys');
     } catch (err) {
+      recordCronRun('idempotency-purge', 'failure', startedAt, new Date(), err);
       logger.error({ err }, 'Monitor cron: idempotency key purge failed');
     }
   });

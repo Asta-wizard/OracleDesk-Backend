@@ -4,7 +4,7 @@ This is the contract between `OracleDesk-Frontend` and this backend. The
 Soroban contracts in `OracleDesk-SmartContract/oracledesk-stellar` are the
 source of truth for anything on-chain; this API never overrides them.
 
-Base URL: `/api/v1` (liveness is `/health`, readiness is `/readyz`).
+Base URL: `/api/v1` (liveness is `/livez`, readiness is `/readyz`).
 
 ## Conventions
 
@@ -127,9 +127,13 @@ useMutation({
 
 ### Health
 
-`GET /health` → `{ status: "healthy", uptime: number }`
+`GET /livez` → `{ status: "alive" }`. Process health only (event-loop delay, fatal flag); never touches a dependency, so an outage cannot restart every instance. `503 NOT_ALIVE` when the loop is stalled.
 
-`GET /readyz` → `200` when the database is reachable, `503 NOT_READY` otherwise.
+`GET /readyz` → `200 { status: "ready", checks }` when every critical dependency is up, `503 NOT_READY` with `status: "not_ready"` otherwise, or `status: "draining"` once shutdown has begun. Each check is `{ name, ok, critical, latencyMs, error? }` for `database`, `redis`, `rpc` and `indexer`; `error` is one of `timeout`, `connection_refused`, `rpc_unhealthy`, `lagging`, `unavailable`. Probes time out after `HEALTH_PROBE_TIMEOUT_MS`, results are cached for `HEALTH_CACHE_TTL_MS` (failures for 500 ms) and concurrent calls share one run. `HEALTH_CRITICAL` (default `database,redis`) picks which dependencies fail readiness. Both endpoints bypass the rate limiter.
+
+`GET /health` → `{ status: "healthy", uptime: number }`. Deprecated: it sends `Deprecation: true` and `Link: </readyz>; rel="successor-version"`.
+
+`GET /api/v1/admin/status` (admin JWT) → probe details with latencies, indexer cursor vs RPC latest ledger and lag, last success/failure per cron job (in memory, reset on restart), chain execution mode, agent public key, LLM provider configuration and Gemini breaker state, and process info.
 
 ### Auth (signed challenge, SEP-10 style)
 

@@ -5,6 +5,13 @@ import { TraceAuditStatus } from '@prisma/client';
 import { runTraceAudit } from '../services/trace-audit.service';
 import { sendSuccess, sendError, parsePagination, buildPaginationMeta } from '../utils/response.util';
 import { logger } from '../lib/logger';
+import { config } from '../config';
+import { secret } from '../config/secrets';
+import { health } from '../services/health.service';
+import { indexerStatus } from '../services/indexer.service';
+import { agentSigner } from '../services/stellar/clients';
+import { geminiBreakerState } from '../lib/gemini';
+import { getCronStatus } from '../cron/registry';
 
 /**
  * GET /admin/trace-audit
@@ -82,4 +89,41 @@ export async function triggerTraceAuditRun(req: Request, res: Response): Promise
   });
 
   sendSuccess(res, { runId, message: 'Trace audit run scheduled' }, 202);
+}
+
+/**
+ * GET /admin/status (#111)
+ * Probe details, indexer lag, cron runs, chain mode and LLM state. Unlike
+ * /readyz this includes ledger numbers, so it is admin-only.
+ */
+export async function getSystemStatus(_req: Request, res: Response): Promise<void> {
+  const { ready, checks } = await health.readiness();
+  const latestLedger = checks.find((c) => c.name === 'rpc')?.detail?.latestLedger;
+  const indexer = indexerStatus();
+  sendSuccess(res, {
+    ready,
+    draining: health.isDraining(),
+    checks,
+    indexer: {
+      ...indexer,
+      rpcLatestLedger: typeof latestLedger === 'number' ? latestLedger : null,
+      lagLedgers: typeof latestLedger === 'number' && indexer.lastLedger !== null ? latestLedger - indexer.lastLedger : null,
+    },
+    crons: getCronStatus(),
+    chain: {
+      mode: config.CHAIN_EXECUTION_MODE,
+      agentPublicKey: agentSigner().publicKey ?? null,
+      preflight: 'not_implemented',
+    },
+    llm: {
+      anthropicConfigured: secret('ANTHROPIC_API_KEY') !== '',
+      geminiConfigured: secret('GEMINI_API_KEY') !== '',
+      geminiBreaker: geminiBreakerState(),
+    },
+    process: {
+      uptimeSeconds: process.uptime(),
+      memory: process.memoryUsage(),
+      version: process.env.npm_package_version ?? null,
+    },
+  });
 }
