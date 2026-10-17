@@ -1,5 +1,6 @@
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
+import { writeAgentLog } from '../lib/agent-log';
 import { calculateKellySize } from './trade.service';
 import { AppError } from '../middlewares/error.middleware';
 import type { HedgeRecommendation } from '../types';
@@ -110,19 +111,17 @@ export async function autoHedge(recommendation: HedgeRecommendation): Promise<an
   });
 
   // Log the hedge rationale for auditability
-  await prisma.agentLog.create({
+  await writeAgentLog({
+    agentType: 'TRADER',
+    level:     'INFO',
+    action:    'AUTO_HEDGE_EXECUTED',
+    marketId:  recommendation.hedgeMarketId,
     data: {
-      agentType: 'TRADER',
-      level:     'INFO',
-      action:    'AUTO_HEDGE_EXECUTED',
-      marketId:  recommendation.hedgeMarketId,
-      data: {
-        originalMarketId: recommendation.originalMarketId,
-        hedgeTradeId:     hedgeTrade.id,
-        hedgeDirection:   recommendation.hedgeDirection,
-        hedgeSize:        recommendation.hedgeSize,
-        rationale:        recommendation.rationale,
-      },
+      originalMarketId: recommendation.originalMarketId,
+      hedgeTradeId:     hedgeTrade.id,
+      hedgeDirection:   recommendation.hedgeDirection,
+      hedgeSize:        recommendation.hedgeSize,
+      rationale:        recommendation.rationale,
     },
   });
 
@@ -194,13 +193,11 @@ export async function checkDailyDrawdown(bankroll: number): Promise<{
     const pauseUntil = new Date(Date.now() + DRAWDOWN_PAUSE_HOURS * 60 * 60 * 1000);
     logger.warn({ drawdownPct, pauseUntil }, 'Daily drawdown limit reached — pausing agent');
 
-    await prisma.agentLog.create({
-      data: {
-        agentType: 'TRADER',
-        level:     'WARN',
-        action:    'DRAWDOWN_PAUSE',
-        data:      { drawdownPct, dailyLoss, pauseUntil: pauseUntil.toISOString() },
-      },
+    await writeAgentLog({
+      agentType: 'TRADER',
+      level:     'WARN',
+      action:    'DRAWDOWN_PAUSE',
+      data:      { drawdownPct, dailyLoss, pauseUntil: pauseUntil.toISOString() },
     });
 
     return { isPaused: true, drawdownPct, pauseUntil };

@@ -104,6 +104,7 @@ const envSchema = z
     RESOLUTION_THRESHOLD: z.string().default('1').transform(Number),
     RESOLUTION_DISPUTE_WINDOW_SECS: z.string().default('86400').transform(Number),
 
+    TRUST_INBOUND_REQUEST_ID: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
     INDEXER_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
     INDEXER_POLL_MS: z.string().default('5000').transform(Number),
 

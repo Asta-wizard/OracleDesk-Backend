@@ -1,4 +1,5 @@
 import type { Response } from 'express';
+import { currentContext } from '../lib/context';
 import type { ApiResponse, ApiError, PaginationMeta } from '../types';
 
 /**
@@ -24,7 +25,10 @@ export function sendError(
   message: string,
   details?: Record<string, unknown>,
 ): void {
-  const error: ApiError = { code, message, details };
+  // The header is set first in the chain, so it survives lost async context.
+  const header = res.getHeader('X-Request-Id');
+  const requestId = typeof header === 'string' ? header : currentContext()?.requestId;
+  const error: ApiError = { code, message, details, requestId };
   const body: ApiResponse<null> = { ok: false, data: null, error };
   res.status(statusCode).json(body);
 }

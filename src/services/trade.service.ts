@@ -1,4 +1,5 @@
 import { prisma } from '../lib/prisma';
+import { writeAgentLog } from '../lib/agent-log';
 import { logger } from '../lib/logger';
 import { AppError } from '../middlewares/error.middleware';
 import type { KellyResult, TradePayload, KellyInput } from '../types';
@@ -328,8 +329,6 @@ async function logAgentAction(
   data?: Record<string, unknown>,
 ): Promise<void> {
   try {
-    await prisma.agentLog.create({
-      data: { agentType, level, action, marketId: marketId ?? undefined, data: data as any },
-    });
+    await writeAgentLog({ agentType, level, action, marketId: marketId ?? undefined, data });
   } catch {}
 }

@@ -3,6 +3,7 @@ import jwt from 'jsonwebtoken';
 import { config } from '../config';
 import { previousSecret, secret, secretEntry } from '../config/secrets';
 import { sendError } from '../utils/response.util';
+import { currentContext } from '../lib/context';
 
 export interface JwtPayload {
   userId: string;
@@ -41,6 +42,12 @@ function decode(req: Request): { user?: JwtPayload; error?: 'missing' | 'expired
   }
 }
 
+/** Tag the request's log context with the caller (mutates this request's own store object). */
+function setContextUser(userId: string): void {
+  const ctx = currentContext();
+  if (ctx) ctx.userId = userId;
+}
+
 /**
  * Require a valid JWT Bearer token. Attaches decoded payload to req.user.
  */
@@ -48,6 +55,7 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
   const { user, error } = decode(req);
   if (user) {
     req.user = user;
+    setContextUser(user.userId);
     next();
     return;
   }
@@ -59,7 +67,10 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
 /** Attaches req.user when a valid token is present; never rejects. */
 export function optionalAuth(req: Request, _res: Response, next: NextFunction): void {
   const { user } = decode(req);
-  if (user) req.user = user;
+  if (user) {
+    req.user = user;
+    setContextUser(user.userId);
+  }
   next();
 }
 

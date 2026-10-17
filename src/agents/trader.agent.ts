@@ -5,6 +5,7 @@ import { checkCorrelation } from '../services/correlation.service';
 import { generateReasoningTrace } from '../services/reasoning.service';
 import { detectHedgeOpportunities, autoHedge, checkDailyDrawdown, enforceStopLoss } from '../services/hedging.service';
 import { prisma } from '../lib/prisma';
+import { writeAgentLog } from '../lib/agent-log';
 import { logger } from '../lib/logger';
 import { config } from '../config';
 import { deadline } from '../lib/resilience';
@@ -99,9 +100,7 @@ export async function runTraderCycle(opts?: { signal?: AbortSignal }): Promise<v
     logger.info('Trader Agent: cycle complete');
   } catch (err) {
     logger.error({ err }, 'Trader Agent: unhandled cycle error');
-    await prisma.agentLog.create({
-      data: { agentType: 'TRADER', level: 'ERROR', action: 'CYCLE_FAILED', error: String(err) },
-    });
+    await writeAgentLog({ agentType: 'TRADER', level: 'ERROR', action: 'CYCLE_FAILED', error: String(err) });
   } finally {
     handle.cleanup?.();
   }
